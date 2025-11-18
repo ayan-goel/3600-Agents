@@ -3,10 +3,10 @@ from collections.abc import Iterable
 from typing import Set, Tuple
 
 from board_utils import get_board_string
-from game.board import Board
-from game.enums import Direction, MoveType, Result, ResultArbiter, WinReason
-from game.game_map import GameMap
-from game.trapdoor_manager import TrapdoorManager
+from engine.game.board import Board
+from engine.game.enums import Direction, MoveType, Result, ResultArbiter, WinReason
+from engine.game.game_map import GameMap
+from engine.game.trapdoor_manager import TrapdoorManager
 from player_process import PlayerProcess
 
 

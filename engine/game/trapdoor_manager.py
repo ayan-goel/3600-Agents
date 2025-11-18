@@ -2,10 +2,10 @@ from typing import List, Tuple
 
 import numpy as np
 
-from game.chicken import Chicken
-from game.enums import Cell, Direction, MoveType, Result, WinReason
-from game.game_map import GameMap, prob_feel, prob_hear
-from game.history import History
+from .chicken import Chicken
+from .enums import Cell, Direction, MoveType, Result, WinReason
+from .game_map import GameMap, prob_feel, prob_hear
+from .history import History
 
 
 def delta_locs(loc_a: Tuple[int, int], loc_b: Tuple[int, int]) -> Tuple[int, int]:
