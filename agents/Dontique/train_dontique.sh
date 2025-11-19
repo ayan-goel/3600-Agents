@@ -22,4 +22,4 @@ else
 fi
 
 echo "Starting Dontique training..."
-python -u -m agents.Dontique.train_s_agent
+python -u -m agents.Dontique.train_s_agent --fresh-start

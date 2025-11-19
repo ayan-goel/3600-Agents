@@ -15,7 +15,7 @@ def main():
     sim_time = time.perf_counter()
 
     top_level = pathlib.Path(__file__).parent.parent.resolve()
-    play_directory = os.path.join(top_level, "3600-agents")
+    play_directory = os.path.join(top_level, "agents")
 
     player_a_name = sys.argv[1]
     player_b_name = sys.argv[2]
