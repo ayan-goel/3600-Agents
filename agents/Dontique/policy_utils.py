@@ -29,11 +29,15 @@ class ActionBiasParams:
     farm_hold_threshold: int = 2
     farm_move_bonus: float = 0.35
     farm_move_penalty: float = 0.85
+    farm_danger_distance: int = 3
     force_egg_below: int = 4
     force_egg_prob_cap: float = 0.35
     force_egg_deficit: int = 1
     deficit_egg_multiplier: float = 4.0
     deficit_egg_force_start: int = 1
+    egg_cooldown_bias_start: int = 4
+    egg_cooldown_force: int = 7
+    egg_cooldown_bonus: float = 1.6
     deficit_temp_zero: int = 3
     seek_enemy_deficit: int = 2
     enemy_egg_seek_bonus: float = 0.4
@@ -44,11 +48,13 @@ class ActionBiasParams:
     defend_lead_for_turd: int = 1
     turd_attack_bonus: float = 1.4
     turd_defense_bonus: float = 1.15
-    trapdoor_risk_scale: float = 2.5
-    trapdoor_zero_threshold: float = 0.15
-    trapdoor_zero_penalty: float = 0.0
+    trapdoor_risk_scale: float = 2.0
+    trapdoor_zero_threshold: float = 0.20
+    trapdoor_zero_penalty: float = 1e-4
     trapdoor_floor: float = 0.05
     min_prob: float = 1e-6
+    endgame_push_turns: int = 10
+    endgame_egg_multiplier: float = 2.0
 
 
 def temperature_for_turn(turn_idx: int) -> float:
@@ -133,6 +139,15 @@ def sample_action_with_bias(
     ):
         best_egg = max(egg_moves, key=lambda idx: visit_dist[idx])
         return best_egg
+    # Periodic egg forcing if it's been too long and safe
+    if (
+        egg_moves
+        and board.can_lay_egg()
+        and since_last_egg >= params.egg_cooldown_force
+        and cur_trap_prob <= params.force_egg_prob_cap
+    ):
+        best_egg = max(egg_moves, key=lambda idx: visit_dist[idx])
+        return best_egg
 
     if effective_temp <= 0:
         best = int(np.argmax(probs))
@@ -151,6 +166,11 @@ def sample_action_with_bias(
             )
             if egg_deficit >= params.deficit_egg_force_start:
                 probs[i] *= params.deficit_egg_multiplier
+            if since_last_egg >= params.egg_cooldown_bias_start:
+                probs[i] *= params.egg_cooldown_bonus
+            # Endgame preference for banking eggs
+            if getattr(board, "turns_left_player", 40) <= params.endgame_push_turns:
+                probs[i] *= params.endgame_egg_multiplier
             continue
 
         if move_type == MoveType.TURD:
@@ -208,10 +228,16 @@ def sample_action_with_bias(
         if move_type == MoveType.PLAIN:
             next_loc = loc_after_direction(cur_loc, direction)
 
-        if move_type == MoveType.PLAIN and my_eggs >= params.farm_hold_threshold:
-            if _manhattan(next_loc, enemy_loc) > enemy_dist_current:
+        # Only bias "hold away from enemy" if enemy is actually close
+        if (
+            move_type == MoveType.PLAIN
+            and my_eggs >= params.farm_hold_threshold
+            and enemy_dist_current <= params.farm_danger_distance
+        ):
+            next_dist = _manhattan(next_loc, enemy_loc)
+            if next_dist > enemy_dist_current:
                 probs[i] *= 1.0 + params.farm_move_bonus
-            elif _manhattan(next_loc, enemy_loc) < enemy_dist_current:
+            elif next_dist < enemy_dist_current:
                 probs[i] *= params.farm_move_penalty
 
         if (
@@ -228,7 +254,7 @@ def sample_action_with_bias(
         if move_type == MoveType.PLAIN:
             next_prob = belief.trapdoor_prob_at(next_loc)
             if next_prob >= params.trapdoor_zero_threshold:
-                probs[i] = params.trapdoor_zero_penalty
+                probs[i] = max(params.min_prob, params.trapdoor_zero_penalty)
                 continue
             risk_penalty = max(
                 params.trapdoor_floor,
