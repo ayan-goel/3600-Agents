@@ -62,7 +62,13 @@ class PlayerAgent:
         # Turd gating parameters
         self.turd_reduction_threshold = 3
         self.turd_self_tolerance = 1
-        self.min_turn_for_turd = 8
+        self.min_turn_for_turd = 6
+        self.rng = np.random.default_rng()
+        # Opening aggression
+        self.opening_aggressive_turns = 8
+        self.min_open_eggs = 2
+        self.outward_weight = 1.2
+        self.spawn_loc = board.chicken_player.get_spawn()
 
     # ------------------------------------------------------------------ #
     # Public API
@@ -86,15 +92,42 @@ class PlayerAgent:
         if not legal_moves:
             return Direction.UP, MoveType.PLAIN
 
+        # Opening sweep: aggressively expand along a cardinal direction, egging every other step
+        sweep_move = self._opening_sweep_move(board, legal_moves)
+        if sweep_move is not None:
+            if sweep_move[1] == MoveType.EGG:
+                self.moves_since_last_egg = 0
+            else:
+                self.moves_since_last_egg += 1
+            return sweep_move
+
         # Immediate egg forcing: choose a legal EGG direction (safest next tile)
         my_eggs = board.chicken_player.get_eggs_laid()
         opp_eggs = board.chicken_enemy.get_eggs_laid()
         deficit = opp_eggs - my_eggs
         endgame = board.turns_left_player <= self.ENDGAME_TURNS
-        cooldown = self.moves_since_last_egg >= 4
+        cooldown = self.moves_since_last_egg >= 3
         egg_moves = [mv for mv in legal_moves if mv[1] == MoveType.EGG]
-        if egg_moves and (endgame or cooldown or deficit > 0):
-            return self._select_safest_egg(board, egg_moves)
+        opening = self.phase == "opening"
+        if egg_moves:
+            if opening and my_eggs >= self.min_open_eggs and not endgame and deficit <= 0 and not cooldown:
+                # In opening, after a couple of eggs, only take eggs that keep the chain going or corners
+                best = None
+                best_chain = -1.0
+                cur = board.chicken_player.get_location()
+                for mv in egg_moves:
+                    nxt = loc_after_direction(cur, mv[0])
+                    chain = self._egg_chain_score(board, nxt, max_depth=2)
+                    if self._is_corner(cur):
+                        chain += 0.5
+                    if chain > best_chain:
+                        best_chain = chain
+                        best = mv
+                if best is not None and best_chain >= 0.7:
+                    return best
+            else:
+                if endgame or cooldown or deficit > 0:
+                    return self._select_safest_egg(board, egg_moves)
         if egg_moves:
             # Opportunistic egg if the safest next tile is low risk
             next_risks = []
@@ -193,10 +226,18 @@ class PlayerAgent:
             lead = my_eggs - opp_eggs
             deficit = -lead if lead < 0 else 0
             risk_w = 8.0 if lead >= 3 else (5.0 if lead >= 1 else (4.0 if deficit >= 2 else 6.0))
+            # Trapdoor no-go in midgame: avoid stepping next to discovered trapdoors unless endgame
+            if self.phase == "midgame" and getattr(board, "found_trapdoors", None):
+                for tloc in board.found_trapdoors:
+                    if abs(tloc[0] - next_loc[0]) + abs(tloc[1] - next_loc[1]) <= 1:
+                        next_risk += 0.25
 
             if mt == MoveType.EGG:
                 risk_here = self._risk_at(cur_loc)
                 base = 100.0
+                # Prefer corner if it does not harm follow-up egg chain
+                chain_after = self._egg_chain_score(board, next_loc, max_depth=2)
+                base += 6.0 * chain_after
                 if self._is_corner(cur_loc):
                     base += 5.0
                 base -= 8.0 * risk_here
@@ -207,11 +248,19 @@ class PlayerAgent:
             if mt == MoveType.TURD:
                 delta_opp, delta_self = self._region_reduction_with_turd(board, cur_loc)
                 chokepoint = self._chokepoint_bonus(board, cur_loc)
+                # Dynamic threshold based on lead/deficit
+                dyn_thresh = self.turd_reduction_threshold + (1 if lead >= 2 else 0) - (1 if deficit >= 2 else 0)
                 allow = (
                     board.turn_count >= self.min_turn_for_turd
-                    and delta_opp >= self.turd_reduction_threshold
+                    and delta_opp >= max(1, dyn_thresh)
                     and delta_self <= self.turd_self_tolerance
                 )
+                # Defend cluster: if enemy close to our dense egg cluster, allow with modest reduction
+                if not allow:
+                    enemy_close = self._enemy_distance(board, cur_loc) <= 3
+                    my_cluster = self._count_nearby(board.eggs_player, cur_loc, radius=2)
+                    if enemy_close and my_cluster >= 3 and delta_opp >= 2:
+                        allow = True
                 if not allow:
                     base = -40.0 - risk_w * next_risk
                 else:
@@ -231,19 +280,30 @@ class PlayerAgent:
             # Endgame 2-step egg scheduler: prefer paths that enable egg in 1–2
             one_away = 1.0 if board.can_lay_egg_at_loc(next_loc) else 0.0
             two_away = 0.0
+            chain3 = 0.0
             if not one_away:
-                for d2 in Direction:
-                    nxt2 = loc_after_direction(next_loc, d2)
-                    if board.is_valid_cell(nxt2) and board.can_lay_egg_at_loc(nxt2):
-                        two_away = 1.0
-                        break
+                two_away = 1.0 if self._egg_in_k_steps(board, next_loc, k=2) else 0.0
+                if not two_away:
+                    chain3 = 1.0 if self._egg_in_k_steps(board, next_loc, k=3) else 0.0
             # Turd adjacency penalty to reduce self-blocking
             adj_pen = 1.0 if self._in_turd_zone(next_loc, board.turds_player) else 0.0
+            # Approximate mobility after moving
+            mobility_next = self._approx_mobility(board, next_loc)
+            mobility_pen = 2.0 if mobility_next <= 1 else (1.0 if mobility_next == 2 else 0.0)
             base = 15.0 + parity_bonus + corner_pull + cooldown_pull
             base -= dist_pen
-            base += 8.0 * one_away + 3.0 * two_away
+            base += 8.0 * one_away + 4.0 * two_away + 2.0 * chain3
+            # Opening outward expansion bonus
+            if self.phase == "opening":
+                sx, sy = self.spawn_loc
+                cur_out = abs(cur_loc[0] - sx) + abs(cur_loc[1] - sy)
+                nxt_out = abs(next_loc[0] - sx) + abs(next_loc[1] - sy)
+                base += self.outward_weight * (nxt_out - cur_out)
             base -= risk_w * next_risk
             base -= 1.5 * adj_pen
+            base -= mobility_pen
+            # Tiny jitter to avoid tie oscillations
+            base += float(self.rng.uniform(-0.05, 0.05))
             scores.append((base, move))
 
         scores.sort(key=lambda x: x[0], reverse=True)
@@ -505,6 +565,95 @@ class PlayerAgent:
         scored.sort(key=lambda item: item[0], reverse=True)
         return [move for _, move in scored]
 
+    # ---- Opening sweep expansion ----
+    def _opening_sweep_move(
+        self,
+        board: Board,
+        legal_moves: Sequence[Tuple[Direction, MoveType]],
+    ) -> Optional[Tuple[Direction, MoveType]]:
+        # Only during the opening aggression window
+        if board.turn_count >= self.opening_aggressive_turns:
+            return None
+        # Ensure we still respect extreme risk
+        cur = board.chicken_player.get_location()
+        dirs = [Direction.UP, Direction.DOWN, Direction.LEFT, Direction.RIGHT]
+
+        # Pre-index legal moves by (dir, type)
+        legal = {(d, mt) for d, mt in legal_moves}
+
+        # Evaluate runway in each direction
+        best_dir = None
+        best_score = -1e9
+        runway_info = {}
+        for d in dirs:
+            steps, eggables, avg_risk = self._runway_stats(board, cur, d, max_steps=6)
+            # Prefer many eggable tiles and longer runway, penalize risk
+            score = 3.0 * eggables + 1.2 * steps - 2.5 * avg_risk
+            # Small tie-break by how far from spawn this points
+            nxt = loc_after_direction(cur, d)
+            score += 0.2 * (abs(nxt[0] - self.spawn_loc[0]) + abs(nxt[1] - self.spawn_loc[1]))
+            runway_info[d] = (steps, eggables, avg_risk, score)
+            if score > best_score:
+                best_score = score
+                best_dir = d
+
+        # Consider a secondary dir if primary is too risky right now
+        sorted_dirs = sorted(dirs, key=lambda dd: runway_info[dd][3], reverse=True)
+        risk_cap = 0.8
+
+        # Try up to two directions
+        for candidate_dir in sorted_dirs[:2]:
+            steps, eggables, avg_risk, _ = runway_info[candidate_dir]
+            if steps <= 0:
+                continue
+            next_loc = loc_after_direction(cur, candidate_dir)
+            next_risk = self._risk_at(next_loc)
+            if next_risk > risk_cap:
+                continue
+
+            # If we can lay an egg now and moving along candidate_dir is legal as EGG, do it
+            if board.can_lay_egg() and ((candidate_dir, MoveType.EGG) in legal):
+                return (candidate_dir, MoveType.EGG)
+
+            # Otherwise, move plain along the candidate_dir if legal, to set up next egg
+            if (candidate_dir, MoveType.PLAIN) in legal:
+                return (candidate_dir, MoveType.PLAIN)
+
+        return None
+
+    def _runway_stats(
+        self,
+        board: Board,
+        start: Tuple[int, int],
+        direction: Direction,
+        max_steps: int = 6,
+    ) -> Tuple[int, int, float]:
+        steps = 0
+        eggables = 0
+        risks: List[float] = []
+        loc = start
+        parity = board.chicken_player.even_chicken
+
+        for _ in range(max_steps):
+            nxt = loc_after_direction(loc, direction)
+            if not board.is_valid_cell(nxt):
+                break
+            if board.is_cell_blocked(nxt):
+                break
+            # We consider hitting the enemy a blocker; do not simulate stepping onto them
+            if nxt == board.chicken_enemy.get_location():
+                break
+            steps += 1
+            risks.append(self._risk_at(nxt))
+            # Eggable tile is the CURRENT tile when we choose EGG, but we are projecting:
+            # On the turn we move to nxt, on the following turn (if parity matches) we can egg at nxt.
+            if (nxt[0] + nxt[1]) % 2 == parity:
+                eggables += 1
+            loc = nxt
+
+        avg_risk = float(np.mean(risks)) if risks else 0.0
+        return steps, eggables, avg_risk
+
     def _turd_pressure(self, board: Board, loc: Tuple[int, int]) -> float:
         enemy_loc = board.chicken_enemy.get_location()
         distance = abs(enemy_loc[0] - loc[0]) + abs(enemy_loc[1] - loc[1])
@@ -714,4 +863,47 @@ class PlayerAgent:
                 if nxt not in visited:
                     q.append(nxt)
         return sites
+
+    # ---- Egg chain helpers ----
+    def _egg_in_k_steps(self, board: Board, loc: Tuple[int, int], k: int) -> bool:
+        if k <= 0:
+            return board.can_lay_egg_at_loc(loc)
+        if board.can_lay_egg_at_loc(loc):
+            return True
+        for d in Direction:
+            nxt = loc_after_direction(loc, d)
+            if not board.is_valid_cell(nxt):
+                continue
+            if board.is_cell_blocked(nxt):
+                continue
+            if self._egg_in_k_steps(board, nxt, k - 1):
+                return True
+        return False
+
+    def _egg_chain_score(self, board: Board, next_loc: Tuple[int, int], max_depth: int = 3) -> float:
+        score = 0.0
+        if board.can_lay_egg_at_loc(next_loc):
+            return 1.0
+        if self._egg_in_k_steps(board, next_loc, k=2):
+            score += 0.7
+        elif max_depth >= 3 and self._egg_in_k_steps(board, next_loc, k=3):
+            score += 0.4
+        return score
+
+    def _approx_mobility(self, board: Board, loc: Tuple[int, int]) -> int:
+        # Count neighbors that are not blocked for a crude mobility estimate
+        m = 0
+        for d in Direction:
+            nxt = loc_after_direction(loc, d)
+            if board.is_valid_cell(nxt) and not board.is_cell_blocked(nxt):
+                m += 1
+        return m
+
+    def _count_nearby(self, items: Iterable[Tuple[int, int]], center: Tuple[int, int], radius: int) -> int:
+        cx, cy = center
+        c = 0
+        for (x, y) in items:
+            if abs(x - cx) + abs(y - cy) <= radius:
+                c += 1
+        return c
 
