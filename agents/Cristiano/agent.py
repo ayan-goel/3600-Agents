@@ -69,6 +69,12 @@ class PlayerAgent:
         self.min_open_eggs = 2
         self.outward_weight = 1.2
         self.spawn_loc = board.chicken_player.get_spawn()
+        # Lane sprint state
+        self.lane_dir: Optional[Direction] = None
+        self.lane_turns_left: int = 0
+        self.open_risk_cap = 0.35
+        # Simple wall-follow heading
+        self.heading: Direction = self._initial_heading(self.spawn_loc)
 
     # ------------------------------------------------------------------ #
     # Public API
@@ -79,20 +85,23 @@ class PlayerAgent:
         sensor_data: List[Tuple[bool, bool]],
         time_left: Callable[[], float],
     ) -> Tuple[Direction, MoveType]:
+        # Hybrid: Match Fluffy's egg cadence + block enemy paths
         self._register_known_trapdoors(board)
         self.trap_belief.update(board.chicken_player, sensor_data)
         self._update_phase(board)
         self._cached_risk_map = self._build_risk_map()
 
         legal_moves = board.get_valid_moves()
-        if board.turn_count < 8:
+        # Allow turds earlier if they block enemy paths significantly
+        if board.turn_count < 4:
             non_turd = [mv for mv in legal_moves if mv[1] != MoveType.TURD]
             if non_turd:
                 legal_moves = non_turd
+        # After turn 4, allow turds if they block enemy paths
         if not legal_moves:
             return Direction.UP, MoveType.PLAIN
 
-        # Opening sweep: aggressively expand along a cardinal direction, egging every other step
+        # Opening sweep: match Fluffy's aggressive expansion
         sweep_move = self._opening_sweep_move(board, legal_moves)
         if sweep_move is not None:
             if sweep_move[1] == MoveType.EGG:
@@ -101,12 +110,12 @@ class PlayerAgent:
                 self.moves_since_last_egg += 1
             return sweep_move
 
-        # Immediate egg forcing: choose a legal EGG direction (safest next tile)
+        # Match Fluffy's exact egg forcing logic (cooldown=3) but add blocking
         my_eggs = board.chicken_player.get_eggs_laid()
         opp_eggs = board.chicken_enemy.get_eggs_laid()
         deficit = opp_eggs - my_eggs
         endgame = board.turns_left_player <= self.ENDGAME_TURNS
-        cooldown = self.moves_since_last_egg >= 3
+        cooldown = self.moves_since_last_egg >= 3  # Match Fluffy exactly
         egg_moves = [mv for mv in legal_moves if mv[1] == MoveType.EGG]
         opening = self.phase == "opening"
         if egg_moves:
@@ -124,9 +133,11 @@ class PlayerAgent:
                         best_chain = chain
                         best = mv
                 if best is not None and best_chain >= 0.7:
+                    self.moves_since_last_egg = 0
                     return best
             else:
                 if endgame or cooldown or deficit > 0:
+                    self.moves_since_last_egg = 0
                     return self._select_safest_egg(board, egg_moves)
         if egg_moves:
             # Opportunistic egg if the safest next tile is low risk
@@ -136,11 +147,12 @@ class PlayerAgent:
                 nxt = loc_after_direction(cur_loc, mv[0])
                 next_risks.append(self._risk_at(nxt))
             if next_risks and min(next_risks) <= 0.6:
+                self.moves_since_last_egg = 0
                 return self._select_safest_egg(board, egg_moves)
 
-        # Greedy move selection: score each legal move and pick best
+        # Greedy move selection: use Fluffy's greedy but with blocking bonuses
         try:
-            move = self._choose_greedy(board, legal_moves)
+            move = self._choose_greedy_hybrid(board, legal_moves)
         except Exception:
             move = legal_moves[0]
 
@@ -205,6 +217,167 @@ class PlayerAgent:
                 best_move = self._select_safest_egg(board, egg_moves)
         return best_move
 
+    def _best_egg_with_blocking(
+        self,
+        board: Board,
+        egg_moves: Sequence[Tuple[Direction, MoveType]],
+    ) -> Optional[Tuple[Direction, MoveType]]:
+        """Choose safest egg move that also blocks enemy paths."""
+        if not egg_moves:
+            return None
+        cur_loc = board.chicken_player.get_location()
+        base_enemy_len = self._enemy_next_egg_path_len(board) or 0
+        
+        best = None
+        best_score = -1e9
+        for mv in egg_moves:
+            nxt = loc_after_direction(cur_loc, mv[0])
+            risk = self._risk_at(nxt)
+            # Simulate move and check enemy path blocking
+            child = board.get_copy()
+            if not child.apply_move(*mv):
+                continue
+            after_len = self._current_next_egg_path_len(child) or 999
+            block_delta = after_len - base_enemy_len
+            
+            # Score: low risk + high blocking
+            score = 100.0 - 50.0 * risk + 20.0 * block_delta
+            if self._is_corner(cur_loc):
+                score += 10.0
+            if score > best_score:
+                best_score = score
+                best = mv
+        return best
+
+    def _choose_greedy_hybrid(
+        self,
+        board: Board,
+        legal_moves: Sequence[Tuple[Direction, MoveType]],
+    ) -> Tuple[Direction, MoveType]:
+        """Match Fluffy's greedy scoring but add blocking bonuses."""
+        my_eggs = board.chicken_player.get_eggs_laid()
+        opp_eggs = board.chicken_enemy.get_eggs_laid()
+        lead = my_eggs - opp_eggs
+        deficit = -lead if lead < 0 else 0
+        egg_sites = self._candidate_egg_sites(board)
+        base_enemy_len = self._enemy_next_egg_path_len(board) or 0
+        
+        scores: List[Tuple[float, Tuple[Direction, MoveType]]] = []
+        
+        for move in legal_moves:
+            dir_, mt = move
+            cur_loc = board.chicken_player.get_location()
+            next_loc = loc_after_direction(cur_loc, dir_)
+            next_risk = self._risk_at(next_loc)
+            risk_w = 8.0 if lead >= 3 else (5.0 if lead >= 1 else (4.0 if deficit >= 2 else 6.0))
+            
+            if mt == MoveType.EGG:
+                risk_here = self._risk_at(cur_loc)
+                base = 100.0  # Match Fluffy's base
+                chain_after = self._egg_chain_score(board, next_loc, max_depth=2)
+                base += 6.0 * chain_after
+                if self._is_corner(cur_loc):
+                    base += 5.0
+                base -= 8.0 * risk_here
+                # More aggressive cooldown bonus
+                if self.moves_since_last_egg >= 2:
+                    base += 8.0
+                elif self.moves_since_last_egg >= 1:
+                    base += 4.0
+                # Blocking bonus (moderate, don't sacrifice egg production)
+                child = board.get_copy()
+                if child.apply_move(*move):
+                    after_len = self._current_next_egg_path_len(child) or 999
+                    block_delta = after_len - base_enemy_len
+                    # Moderate blocking bonus for eggs (don't sacrifice egg production)
+                base += 8.0 * block_delta  # Moderate bonus
+                scores.append((base, move))
+                continue
+            
+            if mt == MoveType.TURD:
+                delta_opp, delta_self = self._region_reduction_with_turd(board, cur_loc)
+                chokepoint = self._chokepoint_bonus(board, cur_loc)
+                dyn_thresh = self.turd_reduction_threshold + (1 if lead >= 2 else 0) - (1 if deficit >= 2 else 0)
+                # Check if turd blocks enemy path significantly
+                child = board.get_copy()
+                blocks_path = False
+                path_block_delta = 0
+                if child.apply_move(*move):
+                    after_len = self._current_next_egg_path_len(child) or 999
+                    path_block_delta = after_len - base_enemy_len
+                    if path_block_delta >= 3:  # Significant blocking
+                        blocks_path = True
+                
+                allow = (
+                    (blocks_path and board.turn_count >= 4) or  # Allow early if significantly blocks path
+                    (board.turn_count >= self.min_turn_for_turd
+                    and delta_opp >= max(1, dyn_thresh)
+                    and delta_self <= self.turd_self_tolerance)
+                )
+                # Defend cluster
+                if not allow:
+                    enemy_close = self._enemy_distance(board, cur_loc) <= 3
+                    my_cluster = self._count_nearby(board.eggs_player, cur_loc, radius=2)
+                    if enemy_close and my_cluster >= 3 and delta_opp >= 2:
+                        allow = True
+                if not allow:
+                    base = -40.0 - risk_w * next_risk
+                else:
+                    base = 10.0 * float(delta_opp) - 7.0 * float(delta_self) + 1.0 * chokepoint
+                    # Strong bonus for blocking enemy path significantly
+                    if blocks_path:
+                        base += 20.0 * path_block_delta  # Strong bonus for path blocking
+                    base -= risk_w * next_risk
+                scores.append((base, move))
+                continue
+            
+            # PLAIN move: match Fluffy's scoring + small blocking bonus
+            parity_bonus = 6.0 if self._is_my_parity(next_loc) else 0.0
+            dist = self._min_distance_to_any(next_loc, egg_sites)
+            dist_pen = 0.0 if dist < 0 else 3.0 * float(dist)
+            corner_pull = 1.5 if self._is_corner(next_loc) else 0.0
+            cooldown_pull = 2.0 if self.moves_since_last_egg >= 4 else 0.0
+            
+            one_away = 1.0 if board.can_lay_egg_at_loc(next_loc) else 0.0
+            two_away = 0.0
+            chain3 = 0.0
+            if not one_away:
+                two_away = 1.0 if self._egg_in_k_steps(board, next_loc, k=2) else 0.0
+                if not two_away:
+                    chain3 = 1.0 if self._egg_in_k_steps(board, next_loc, k=3) else 0.0
+            
+            adj_pen = 1.0 if self._in_turd_zone(next_loc, board.turds_player) else 0.0
+            mobility_next = self._approx_mobility(board, next_loc)
+            mobility_pen = 2.0 if mobility_next <= 1 else (1.0 if mobility_next == 2 else 0.0)
+            
+            base = 15.0 + parity_bonus + corner_pull + cooldown_pull
+            base -= dist_pen
+            base += 8.0 * one_away + 4.0 * two_away + 2.0 * chain3
+            
+            # Opening outward expansion
+            if self.phase == "opening":
+                sx, sy = self.spawn_loc
+                cur_out = abs(cur_loc[0] - sx) + abs(cur_loc[1] - sy)
+                nxt_out = abs(next_loc[0] - sx) + abs(next_loc[1] - sy)
+                base += self.outward_weight * (nxt_out - cur_out)
+            
+            # Balanced blocking bonus - disrupt enemy but prioritize egg routing
+            child = board.get_copy()
+            if child.apply_move(*move):
+                after_len = self._current_next_egg_path_len(child) or 999
+                block_delta = after_len - base_enemy_len
+                # Moderate bonus that doesn't override egg routing
+                base += 8.0 * block_delta
+            
+            base -= risk_w * next_risk
+            base -= 1.5 * adj_pen
+            base -= mobility_pen
+            base += float(self.rng.uniform(-0.05, 0.05))
+            scores.append((base, move))
+        
+        scores.sort(key=lambda x: x[0], reverse=True)
+        return scores[0][1]
+
     def _choose_greedy(
         self,
         board: Board,
@@ -246,7 +419,10 @@ class PlayerAgent:
                 # Cutoff bonus: how much this egg (at current loc) + step reduces opp region
                 cut_delta = self._opponent_region_cutoff_after_move(board, move, opp_region_before)
                 if self.phase in ("opening", "midgame"):
-                    base += (12.0 if self.phase == "opening" else 8.0) * float(cut_delta)
+                    base += (16.0 if self.phase == "opening" else 10.0) * float(cut_delta)
+                # Reduce enemy mobility (simulate)
+                mob_drop = self._enemy_mobility_after_move(board, move)
+                base += 1.5 * max(0, 8 - mob_drop)
                 base += 4.0 if self.moves_since_last_egg >= 3 else 0.0
                 scores.append((base, move))
                 continue
@@ -256,11 +432,14 @@ class PlayerAgent:
                 chokepoint = self._chokepoint_bonus(board, cur_loc)
                 # Dynamic threshold based on lead/deficit
                 dyn_thresh = self.turd_reduction_threshold + (1 if lead >= 2 else 0) - (1 if deficit >= 2 else 0)
-                allow = (
-                    board.turn_count >= self.min_turn_for_turd
-                    and delta_opp >= max(1, dyn_thresh)
-                    and delta_self <= self.turd_self_tolerance
-                )
+                allow = False
+                # Earlier turds if it severs enemy path or large cutoff
+                if self._blocks_enemy_best_path(board, move):
+                    allow = board.turn_count >= 3 and delta_self <= self.turd_self_tolerance
+                elif delta_opp >= max(3, dyn_thresh + 1) and delta_self <= self.turd_self_tolerance:
+                    allow = board.turn_count >= 4
+                elif board.turn_count >= self.min_turn_for_turd and delta_opp >= max(1, dyn_thresh) and delta_self <= self.turd_self_tolerance:
+                    allow = True
                 # Defend cluster: if enemy close to our dense egg cluster, allow with modest reduction
                 if not allow:
                     enemy_close = self._enemy_distance(board, cur_loc) <= 3
@@ -286,7 +465,7 @@ class PlayerAgent:
                 else:
                     base = 10.0 * float(delta_opp) - 7.0 * float(delta_self) + 1.0 * chokepoint
                     if self._blocks_enemy_best_path(board, move):
-                        base += 8.0
+                        base += 18.0
                     # Bonus for turd near enemy cluster center
                     clusters = self._find_egg_clusters(board, for_enemy=True)
                     if clusters:
@@ -294,6 +473,9 @@ class PlayerAgent:
                         center = self._cluster_center(largest)
                         if abs(cur_loc[0] - center[0]) + abs(cur_loc[1] - center[1]) <= 1:
                             base += 6.0
+                    # Reduce enemy mobility strongly
+                    mob_drop = self._enemy_mobility_after_move(board, move)
+                    base += 2.0 * max(0, 10 - mob_drop)
                     base -= risk_w * next_risk
                 scores.append((base, move))
                 continue
@@ -333,16 +515,22 @@ class PlayerAgent:
                 dist_center = abs(next_loc[0] - cx) + abs(next_loc[1] - cy)
                 if dist_center <= 2:
                     base -= 2.0
+                # Add flanking and coverage bias in opening
+                base += 6.0 * self._flank_alignment(cur_loc, board.chicken_enemy.get_location(), dir_)
+                base += 1.2 * self._coverage_gain(board, next_loc)
             # Cutoff and Voronoi advantage after this plain move
             cut_delta = self._opponent_region_cutoff_after_move(board, move, opp_region_before)
             if self.phase in ("opening", "midgame"):
-                base += (12.0 if self.phase == "opening" else 9.0) * float(cut_delta)
+                base += (16.0 if self.phase == "opening" else 11.0) * float(cut_delta)
                 vor_adv = self._voronoi_advantage_after_move(board, move)
-                base += 2.5 * float(vor_adv)
+                base += 5.0 * float(vor_adv)
                 
             # Path blocking bonus
             if self.phase != "endgame" and self._blocks_enemy_best_path(board, move):
-                base += 8.0
+                base += 12.0
+            # Enemy mobility after move (lower is better)
+            mob_drop = self._enemy_mobility_after_move(board, move)
+            base += 1.2 * max(0, 8 - mob_drop)
 
             # Anti-camping penalty for enemy
             if self._enemy_camping(board):
@@ -650,9 +838,9 @@ class PlayerAgent:
 
         # Consider a secondary dir if primary is too risky right now
         sorted_dirs = sorted(dirs, key=lambda dd: runway_info[dd][3], reverse=True)
-        risk_cap = 0.8
+        risk_cap = self.open_risk_cap
 
-        # Try up to two directions
+        # Try up to two directions - prioritize eggs heavily
         for candidate_dir in sorted_dirs[:2]:
             steps, eggables, avg_risk, _ = runway_info[candidate_dir]
             if steps <= 0:
@@ -662,9 +850,11 @@ class PlayerAgent:
             if next_risk > risk_cap:
                 continue
 
-            # If we can lay an egg now and moving along candidate_dir is legal as EGG, do it
+            # Ultra-aggressive: if we can lay an egg, do it (even if not perfect chain)
             if board.can_lay_egg() and ((candidate_dir, MoveType.EGG) in legal):
-                return (candidate_dir, MoveType.EGG)
+                # Only skip if extremely risky
+                if next_risk <= 0.7:
+                    return (candidate_dir, MoveType.EGG)
 
             # Otherwise, move plain along the candidate_dir if legal, to set up next egg
             if (candidate_dir, MoveType.PLAIN) in legal:
@@ -704,6 +894,258 @@ class PlayerAgent:
 
         avg_risk = float(np.mean(risks)) if risks else 0.0
         return steps, eggables, avg_risk
+
+    # ---- Lane sprint helpers ----
+    def _lane_move(
+        self,
+        board: Board,
+        legal_moves: Sequence[Tuple[Direction, MoveType]],
+    ) -> Optional[Tuple[Direction, MoveType]]:
+        # Activate or maintain a lane mainly during opening and early midgame
+        if self.phase not in ("opening", "midgame"):
+            self.lane_dir = None
+            self.lane_turns_left = 0
+            return None
+        # Reset lane if teleported or risk spike
+        cur = board.chicken_player.get_location()
+        if self._risk_at(cur) > 0.85:
+            self.lane_dir = None
+            self.lane_turns_left = 0
+
+        # Acquire a lane if none or expired
+        if self.lane_dir is None or self.lane_turns_left <= 0:
+            cand = self._best_lane(board)
+            if cand is not None:
+                self.lane_dir, score = cand
+                self.lane_turns_left = 6
+            else:
+                return None
+
+        # Follow the lane if legal and safe
+        dir_ = self.lane_dir
+        cur_loc = board.chicken_player.get_location()
+        next_loc = loc_after_direction(cur_loc, dir_)
+        next_risk = self._risk_at(next_loc)
+        # If too risky, drop lane and re-evaluate next turn
+        if next_risk > (0.7 if self.phase == "opening" else 0.9):
+            self.lane_dir = None
+            self.lane_turns_left = 0
+            return None
+
+        legal = {(d, mt) for d, mt in legal_moves}
+        # Egg cadence: egg if we can, else step along the lane
+        if board.can_lay_egg() and (dir_, MoveType.EGG) in legal:
+            self.lane_turns_left -= 1
+            return (dir_, MoveType.EGG)
+        if (dir_, MoveType.PLAIN) in legal:
+            self.lane_turns_left -= 1
+            return (dir_, MoveType.PLAIN)
+
+        # Try slight sidestep to keep lane momentum (prefer perpendicular one that keeps parity schedule)
+        for d2 in (Direction.LEFT, Direction.RIGHT, Direction.UP, Direction.DOWN):
+            if d2 == dir_:
+                continue
+            n2 = loc_after_direction(cur_loc, d2)
+            if not board.is_valid_cell(n2):
+                continue
+            if self._risk_at(n2) > (0.7 if self.phase == "opening" else 0.9):
+                continue
+            if board.can_lay_egg() and (d2, MoveType.EGG) in legal:
+                self.lane_dir = d2  # pivot lane if beneficial
+                self.lane_turns_left = max(self.lane_turns_left - 1, 3)
+                return (d2, MoveType.EGG)
+            if (d2, MoveType.PLAIN) in legal:
+                self.lane_dir = d2
+                self.lane_turns_left = max(self.lane_turns_left - 1, 3)
+                return (d2, MoveType.PLAIN)
+
+        # Lane broken
+        self.lane_dir = None
+        self.lane_turns_left = 0
+        return None
+
+    def _best_lane(self, board: Board) -> Optional[Tuple[Direction, float]]:
+        cur = board.chicken_player.get_location()
+        dirs = [Direction.UP, Direction.DOWN, Direction.LEFT, Direction.RIGHT]
+        # Enemy target center to bias lanes that intersect their shortest path
+        opp_clusters = self._find_egg_clusters(board, for_enemy=True)
+        target_center = None
+        if opp_clusters:
+            target_center = self._cluster_center(max(opp_clusters, key=lambda c: len(c)))
+        enemy_loc = board.chicken_enemy.get_location()
+        enemy_path = None
+        if target_center is not None:
+            enemy_path = self._shortest_path(board, enemy_loc, target_center, block_eggs=board.eggs_player, block_turds=board.turds_player)
+
+        best = None
+        best_score = -1e9
+        for d in dirs:
+            steps, eggables, avg_risk = self._runway_stats(board, cur, d, max_steps=6)
+            if steps <= 0:
+                continue
+            # Aggregate corridor risk along 3 steps
+            corridor_risk = 0.0
+            probe = cur
+            for _ in range(3):
+                probe = loc_after_direction(probe, d)
+                if not board.is_valid_cell(probe):
+                    break
+                corridor_risk += self._risk_at(probe)
+            # Intersection with enemy shortest path early is valuable
+            intersects = 0.0
+            if enemy_path is not None:
+                nxt = loc_after_direction(cur, d)
+                if nxt in enemy_path[:min(4, len(enemy_path))]:
+                    intersects = 1.0
+            # Lane score
+            score = (
+                3.5 * eggables
+                + 1.4 * steps
+                - 2.5 * avg_risk
+                - 1.2 * corridor_risk
+                + 3.0 * intersects
+            )
+            if score > best_score:
+                best_score = score
+                best = (d, score)
+        return best
+
+    def _rail_move(
+        self,
+        board: Board,
+        legal_moves: Sequence[Tuple[Direction, MoveType]],
+    ) -> Optional[Tuple[Direction, MoveType]]:
+        # Only early opening
+        if board.turn_count > 10:
+            return None
+        cur = board.chicken_player.get_location()
+        enemy = board.chicken_enemy.get_location()
+        best = None
+        best_score = -1e9
+        for mv in legal_moves:
+            d, mt = mv
+            nxt = loc_after_direction(cur, d)
+            if not board.is_valid_cell(nxt):
+                continue
+            # Strict risk early
+            if mt == MoveType.EGG:
+                if self._is_high_risk(cur):
+                    continue
+            else:
+                if self._is_high_risk(nxt):
+                    continue
+            dist_edge = min(nxt[0], nxt[1], self.size - 1 - nxt[0], self.size - 1 - nxt[1])
+            open_neighbors = 0
+            for d2 in Direction:
+                nn = loc_after_direction(nxt, d2)
+                if board.is_valid_cell(nn) and not board.is_cell_blocked(nn):
+                    open_neighbors += 1
+            rail = -8.0 * float(dist_edge) + 2.0 * float(max(0, 3 - open_neighbors))
+            center = (self.size // 2, self.size // 2)
+            center_d_before = abs(cur[0] - center[0]) + abs(cur[1] - center[1])
+            center_d_after = abs(nxt[0] - center[0]) + abs(nxt[1] - center[1])
+            tangential = 2.0 * float(center_d_after >= center_d_before)
+            egg_bonus = 0.0
+            if mt == MoveType.EGG and board.can_lay_egg() and self._is_my_parity(cur):
+                egg_bonus = 50.0 + (10.0 if self.moves_since_last_egg >= 1 else 0.0)
+            deny = 20.0 if self._blocks_enemy_best_path(board, mv) else 0.0
+            cover = 1.0 * self._coverage_gain(board, nxt)
+            dist_enemy = abs(nxt[0] - enemy[0]) + abs(nxt[1] - enemy[1])
+            spacing = 3.0 if 2 <= dist_enemy <= 4 else (-4.0 if dist_enemy <= 1 else 1.0)
+            score = rail + tangential + egg_bonus + deny + cover + spacing - 4.0 * self._risk_at(nxt)
+            if score > best_score:
+                best_score = score
+                best = mv
+        return best
+
+    # ---- Encircle mode (opening) ----
+    def _encircle_move(
+        self,
+        board: Board,
+        legal_moves: Sequence[Tuple[Direction, MoveType]],
+    ) -> Optional[Tuple[Direction, MoveType]]:
+        if self.phase != "opening":
+            return None
+        # Only first few turns focus on encircling
+        if board.turn_count > 8:
+            return None
+        enemy = board.chicken_enemy.get_location()
+        cur = board.chicken_player.get_location()
+        legal = list(legal_moves)
+        if not legal:
+            return None
+        # Score each move by flank + coverage + safety
+        best = None
+        best_score = -1e9
+        for mv in legal:
+            d, mt = mv
+            nxt = loc_after_direction(cur, d)
+            # Risk constraints
+            if mt == MoveType.EGG:
+                # Must be safe to lay (current low risk) and step safe
+                if self._is_high_risk(cur):
+                    continue
+                if self._risk_at(nxt) > self.open_risk_cap:
+                    continue
+            else:
+                if self._risk_at(nxt) > self.open_risk_cap:
+                    continue
+            flank = self._flank_alignment(cur, enemy, d)
+            cover = self._coverage_gain(board, nxt)
+            base = 0.0
+            if mt == MoveType.EGG:
+                # Prefer parity egg forcing
+                if not board.can_lay_egg():
+                    continue
+                if not self._is_my_parity(cur):
+                    continue
+                base = 60.0
+            else:
+                base = 15.0
+            score = base + 8.0 * flank + 1.5 * cover - 4.0 * self._risk_at(nxt)
+            # Prefer not to reduce distance below 1 (avoid head-on unless blocking)
+            dist_after = abs(nxt[0] - enemy[0]) + abs(nxt[1] - enemy[1])
+            if dist_after <= 1:
+                score -= 6.0
+            if score > best_score:
+                best_score = score
+                best = mv
+        return best
+
+    def _dir_vec(self, d: Direction) -> Tuple[int, int]:
+        if d == Direction.UP:
+            return (0, -1)
+        if d == Direction.DOWN:
+            return (0, 1)
+        if d == Direction.LEFT:
+            return (-1, 0)
+        if d == Direction.RIGHT:
+            return (1, 0)
+        return (0, 0)
+
+    def _flank_alignment(self, us: Tuple[int, int], enemy: Tuple[int, int], d: Direction) -> float:
+        vx = enemy[0] - us[0]
+        vy = enemy[1] - us[1]
+        # Perpendicular vector to v
+        px, py = -vy, vx
+        # Normalize p
+        norm = max(1.0, float(abs(px) + abs(py)))
+        px /= norm
+        py /= norm
+        dx, dy = self._dir_vec(d)
+        return abs(px * dx + py * dy)
+
+    def _coverage_gain(self, board: Board, loc: Tuple[int, int]) -> float:
+        # Distance to nearest of our eggs/turds as proxy for frontier expansion
+        items = list(board.eggs_player) + list(board.turds_player)
+        if not items:
+            return 2.0
+        best = 10**9
+        for (x, y) in items:
+            d = abs(x - loc[0]) + abs(y - loc[1])
+            if d < best:
+                best = d
+        return float(best)
 
     def _turd_pressure(self, board: Board, loc: Tuple[int, int]) -> float:
         enemy_loc = board.chicken_enemy.get_location()
@@ -1229,4 +1671,219 @@ class PlayerAgent:
              if nearby_eggs >= 3:
                  return True
         return False
+
+    # ---- Risk thresholds ----
+    def _is_high_risk(self, loc: Tuple[int, int]) -> bool:
+        r = self._risk_at(loc)
+        if self.phase == "opening":
+            return r > 0.35
+        if self.phase == "midgame":
+            return r > 0.55
+        return r > 0.8
+
+    # ---- Enemy mobility after our move ----
+    def _enemy_mobility_after_move(self, board: Board, move: Tuple[Direction, MoveType]) -> int:
+        child = board.get_copy()
+        if not child.apply_move(*move):
+            return 0
+        # After our move, it's enemy's turn; current player's moves reflect enemy mobility
+        return len(child.get_valid_moves())
+
+    # ---- Simple policy helpers ----
+    def _initial_heading(self, spawn: Tuple[int, int]) -> Direction:
+        x, y = spawn
+        left = x
+        right = self.size - 1 - x
+        up = y
+        down = self.size - 1 - y
+        best = min(left, right, up, down)
+        if best == left:
+            return Direction.LEFT
+        if best == right:
+            return Direction.RIGHT
+        if best == up:
+            return Direction.UP
+        return Direction.DOWN
+
+    def _rotate_clockwise(self, d: Direction) -> Direction:
+        if d == Direction.UP:
+            return Direction.RIGHT
+        if d == Direction.RIGHT:
+            return Direction.DOWN
+        if d == Direction.DOWN:
+            return Direction.LEFT
+        return Direction.UP
+
+    def _risk_cap(self) -> float:
+        if self.phase == "opening":
+            return 0.35
+        if self.phase == "midgame":
+            return 0.55
+        return 0.8
+
+    def _best_egg_move(self, cur: Tuple[int, int], egg_moves: Sequence[Tuple[Direction, MoveType]]) -> Optional[Tuple[Direction, MoveType]]:
+        # Prefer heading-aligned egg move if safe next
+        heading_moves = [mv for mv in egg_moves if mv[0] == self.heading]
+        if heading_moves:
+            mv = heading_moves[0]
+            nxt = loc_after_direction(cur, mv[0])
+            if self._risk_at(nxt) <= self._risk_cap():
+                return mv
+        # Else choose minimal next risk
+        best = None
+        best_r = 1e9
+        for mv in egg_moves:
+            nxt = loc_after_direction(cur, mv[0])
+            r = self._risk_at(nxt)
+            if r < best_r:
+                best_r = r
+                best = mv
+        return best
+
+    def _best_plain_move(self, board: Board, cur: Tuple[int, int], legal_moves: Sequence[Tuple[Direction, MoveType]]) -> Optional[Tuple[Direction, MoveType]]:
+        tried = set()
+        d = self.heading
+        for _ in range(4):
+            cand = (d, MoveType.PLAIN)
+            if cand in legal_moves:
+                nxt = loc_after_direction(cur, d)
+                if self._risk_at(nxt) <= self._risk_cap():
+                    return cand
+            tried.add(d)
+            d = self._rotate_clockwise(d)
+        # If none met risk cap, pick safest plain
+        plains = [mv for mv in legal_moves if mv[1] == MoveType.PLAIN]
+        if not plains:
+            return None
+        return min(plains, key=lambda mv: self._risk_at(loc_after_direction(cur, mv[0])))
+
+    # ---- Spreader targeting ----
+    def _all_parity_sites(self, board: Board) -> List[Tuple[int, int]]:
+        sites: List[Tuple[int, int]] = []
+        for y in range(self.size):
+            for x in range(self.size):
+                loc = (x, y)
+                if board.can_lay_egg_at_loc(loc):
+                    sites.append(loc)
+        return sites
+
+    def _min_dist_to_our_eggs(self, board: Board, loc: Tuple[int, int]) -> int:
+        if not board.eggs_player:
+            return 9
+        best = 10**9
+        for (ex, ey) in board.eggs_player:
+            d = abs(ex - loc[0]) + abs(ey - loc[1])
+            if d < best:
+                best = d
+        return best
+
+    def _select_spread_target(self, board: Board, cur: Tuple[int, int], eggs: int, endgame: bool) -> Optional[Tuple[int, int]]:
+        candidates = [loc for loc in self._all_parity_sites(board) if loc not in board.eggs_player]
+        if not candidates:
+            return None
+        # Separation weight high early, lower later
+        sep_w = 6.0 if eggs < 8 else (3.0 if eggs < 14 else 1.0)
+        # In endgame, prefer nearest
+        if endgame:
+            return min(candidates, key=lambda loc: abs(loc[0] - cur[0]) + abs(loc[1] - cur[1]))
+        center = (self.size // 2, self.size // 2)
+        best = None
+        best_score = -1e9
+        for loc in candidates:
+            sep = float(self._min_dist_to_our_eggs(board, loc))
+            dist_me = abs(loc[0] - cur[0]) + abs(loc[1] - cur[1])
+            dist_center = abs(loc[0] - center[0]) + abs(loc[1] - center[1])
+            risk = self._risk_at(loc)
+            score = sep_w * sep + 0.6 * dist_center - 1.2 * dist_me - 8.0 * risk
+            if score > best_score:
+                best_score = score
+                best = loc
+        return best
+
+    def _choose_move_toward(
+        self,
+        board: Board,
+        cur: Tuple[int, int],
+        target: Optional[Tuple[int, int]],
+        moves: Sequence[Tuple[Direction, MoveType]],
+    ) -> Optional[Tuple[Direction, MoveType]]:
+        if not moves:
+            return None
+        if target is None:
+            # pick safest
+            return min(moves, key=lambda mv: self._risk_at(loc_after_direction(cur, mv[0])))
+        best = None
+        best_s = -1e9
+        for mv in moves:
+            nxt = loc_after_direction(cur, mv[0])
+            d_after = abs(nxt[0] - target[0]) + abs(nxt[1] - target[1])
+            risk = self._risk_at(nxt)
+            s = -1.5 * d_after - 6.0 * risk
+            # prefer not to step adjacent to our turds
+            if self._in_turd_zone(nxt, board.turds_player):
+                s -= 2.0
+            if s > best_s:
+                best_s = s
+                best = mv
+        return best
+
+    # ---- Anti-Fluffy: enemy path lengths ----
+    def _enemy_candidate_spots(self, board: Board) -> List[Tuple[int, int]]:
+        spots: List[Tuple[int, int]] = []
+        parity = board.chicken_enemy.even_chicken
+        for y in range(self.size):
+            for x in range(self.size):
+                loc = (x, y)
+                if (x + y) % 2 != parity:
+                    continue
+                if loc in board.eggs_enemy:
+                    continue
+                if not board.is_valid_cell(loc):
+                    continue
+                if board.is_cell_blocked(loc):
+                    continue
+                spots.append(loc)
+        return spots
+
+    def _nearest_path_len(self, board: Board, start: Tuple[int, int], spots: List[Tuple[int, int]], block_eggs: Iterable[Tuple[int, int]], block_turds: Iterable[Tuple[int, int]], block_opponent: Optional[Tuple[int, int]] = None) -> Optional[int]:
+        best = None
+        for loc in spots:
+            path = self._shortest_path(board, start, loc, block_eggs=block_eggs, block_turds=block_turds, extra_block=block_opponent)
+            if path is None:
+                continue
+            steps = max(0, len(path) - 1)
+            if best is None or steps < best:
+                best = steps
+        return best
+
+    def _enemy_next_egg_path_len(self, board: Board) -> Optional[int]:
+        enemy_loc = board.chicken_enemy.get_location()
+        spots = self._enemy_candidate_spots(board)
+        if not spots:
+            return None
+        return self._nearest_path_len(board, enemy_loc, spots, block_eggs=board.eggs_player, block_turds=board.turds_player)
+
+    def _current_candidate_spots(self, board: Board) -> List[Tuple[int, int]]:
+        spots: List[Tuple[int, int]] = []
+        parity = board.chicken_player.even_chicken
+        for y in range(self.size):
+            for x in range(self.size):
+                loc = (x, y)
+                if (x + y) % 2 != parity:
+                    continue
+                if loc in board.eggs_player:
+                    continue
+                if not board.is_valid_cell(loc):
+                    continue
+                if board.is_cell_blocked(loc):
+                    continue
+                spots.append(loc)
+        return spots
+
+    def _current_next_egg_path_len(self, board: Board) -> Optional[int]:
+        start = board.chicken_player.get_location()
+        spots = self._current_candidate_spots(board)
+        if not spots:
+            return None
+        return self._nearest_path_len(board, start, spots, block_eggs=board.eggs_enemy, block_turds=board.turds_enemy)
 

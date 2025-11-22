@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Callable, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 
@@ -69,6 +69,15 @@ class PlayerAgent:
         self.min_open_eggs = 2
         self.outward_weight = 1.2
         self.spawn_loc = board.chicken_player.get_spawn()
+        # Exploration tracking
+        self.visit_counts = np.zeros((self.size, self.size), dtype=np.int16)
+        spawn = board.chicken_player.get_location()
+        self.visit_counts[spawn[1], spawn[0]] = 1
+        self.visited_tiles: Set[Tuple[int, int]] = {spawn}
+        self.frontier_target: Optional[Tuple[int, int]] = None
+        self.frontier_refresh_turn: int = -1
+        # Track last location to discourage immediate backtracks
+        self.prev_loc: Tuple[int, int] = spawn
 
     # ------------------------------------------------------------------ #
     # Public API
@@ -83,6 +92,8 @@ class PlayerAgent:
         self.trap_belief.update(board.chicken_player, sensor_data)
         self._update_phase(board)
         self._cached_risk_map = self._build_risk_map()
+        self._record_visit(board.chicken_player.get_location())
+        self._maybe_refresh_frontier(board)
 
         legal_moves = board.get_valid_moves()
         if board.turn_count < 8:
@@ -99,6 +110,9 @@ class PlayerAgent:
                 self.moves_since_last_egg = 0
             else:
                 self.moves_since_last_egg += 1
+            # Update prev_loc to the next location we intend to step onto
+            cur = board.chicken_player.get_location()
+            self.prev_loc = loc_after_direction(cur, sweep_move[0])
             return sweep_move
 
         # Immediate egg forcing: choose a legal EGG direction (safest next tile)
@@ -124,10 +138,14 @@ class PlayerAgent:
                         best_chain = chain
                         best = mv
                 if best is not None and best_chain >= 0.7:
+                    # Update prev_loc to the next location we intend to step onto
+                    self.prev_loc = loc_after_direction(board.chicken_player.get_location(), best[0])
                     return best
             else:
                 if endgame or cooldown or deficit > 0:
-                    return self._select_safest_egg(board, egg_moves)
+                    chosen = self._select_safest_egg(board, egg_moves)
+                    self.prev_loc = loc_after_direction(board.chicken_player.get_location(), chosen[0])
+                    return chosen
         if egg_moves:
             # Opportunistic egg if the safest next tile is low risk
             next_risks = []
@@ -136,7 +154,9 @@ class PlayerAgent:
                 nxt = loc_after_direction(cur_loc, mv[0])
                 next_risks.append(self._risk_at(nxt))
             if next_risks and min(next_risks) <= 0.6:
-                return self._select_safest_egg(board, egg_moves)
+                chosen = self._select_safest_egg(board, egg_moves)
+                self.prev_loc = loc_after_direction(board.chicken_player.get_location(), chosen[0])
+                return chosen
 
         # Greedy move selection: score each legal move and pick best
         try:
@@ -148,6 +168,8 @@ class PlayerAgent:
             self.moves_since_last_egg = 0
         else:
             self.moves_since_last_egg += 1
+        # Update prev_loc to the next location we intend to step onto
+        self.prev_loc = loc_after_direction(board.chicken_player.get_location(), move[0])
         return move
 
     # ------------------------------------------------------------------ #
@@ -214,10 +236,22 @@ class PlayerAgent:
         my_eggs = board.chicken_player.get_eggs_laid()
         scores: List[Tuple[float, Tuple[Direction, MoveType]]] = []
         egg_sites = self._candidate_egg_sites(board)
+        cur_loc = board.chicken_player.get_location()
+        # Check if there exists a safe novel option among plains to encourage exploration
+        safe_novel_exists = False
+        for d, mt in legal_moves:
+            if mt != MoveType.PLAIN:
+                continue
+            nxt = loc_after_direction(cur_loc, d)
+            if not board.is_valid_cell(nxt):
+                continue
+            if self._risk_at(nxt) <= 0.8 and 0 <= nxt[0] < self.size and 0 <= nxt[1] < self.size:
+                if int(self.visit_counts[nxt[1], nxt[0]]) == 0:
+                    safe_novel_exists = True
+                    break
 
         for move in legal_moves:
             dir_, mt = move
-            cur_loc = board.chicken_player.get_location()
             next_loc = loc_after_direction(cur_loc, dir_)
             next_risk = self._risk_at(next_loc)
             # Risk shaping: tighten when ahead, loosen when behind
@@ -241,6 +275,7 @@ class PlayerAgent:
                 if self._is_corner(cur_loc):
                     base += 5.0
                 base -= 8.0 * risk_here
+                base -= 2.0 * self._coverage_penalty(cur_loc)
                 base += 4.0 if self.moves_since_last_egg >= 3 else 0.0
                 scores.append((base, move))
                 continue
@@ -299,6 +334,23 @@ class PlayerAgent:
                 cur_out = abs(cur_loc[0] - sx) + abs(cur_loc[1] - sy)
                 nxt_out = abs(next_loc[0] - sx) + abs(next_loc[1] - sy)
                 base += self.outward_weight * (nxt_out - cur_out)
+            # Exploration incentives
+            # Stronger novelty pull and frontier chase; punish revisits if novel options exist
+            base += (self._novelty_bonus(next_loc) + 2.0)  # boost overall novelty pull slightly
+            base += 5.0 * (1.0 if self.frontier_target is not None else 0.0) * (
+                max(0, (abs(cur_loc[0] - self.frontier_target[0]) + abs(cur_loc[1] - self.frontier_target[1]))
+                    - (abs(next_loc[0] - self.frontier_target[0]) + abs(next_loc[1] - self.frontier_target[1])))
+            )
+            coverage = self._coverage_penalty(next_loc)
+            base -= 1.8 * coverage
+            if safe_novel_exists and coverage >= 2.0:
+                base -= 5.0
+            # Avoid immediate backtracks
+            if next_loc == self.prev_loc:
+                base -= 18.0
+            # Avoid moving to tiles that are non-eggable for a while in opening
+            if self.phase == "opening" and not one_away and not two_away:
+                base -= 4.0
             base -= risk_w * next_risk
             base -= 1.5 * adj_pen
             base -= mobility_pen
@@ -565,6 +617,87 @@ class PlayerAgent:
         scored.sort(key=lambda item: item[0], reverse=True)
         return [move for _, move in scored]
 
+    # ---- Exploration tracking ----
+    def _record_visit(self, loc: Tuple[int, int]) -> None:
+        x, y = loc
+        if 0 <= x < self.size and 0 <= y < self.size:
+            current = int(self.visit_counts[y, x])
+            if current < np.iinfo(self.visit_counts.dtype).max:
+                self.visit_counts[y, x] = current + 1
+            self.visited_tiles.add(loc)
+
+    def _maybe_refresh_frontier(self, board: Board) -> None:
+        if (
+            self.frontier_target is None
+            or self.visit_counts[self.frontier_target[1], self.frontier_target[0]] > 0
+            or board.turn_count - self.frontier_refresh_turn >= 3
+        ):
+            self.frontier_target = self._compute_frontier_target(board)
+            self.frontier_refresh_turn = board.turn_count
+
+    def _compute_frontier_target(self, board: Board) -> Optional[Tuple[int, int]]:
+        start = board.chicken_player.get_location()
+        enemy_loc = board.chicken_enemy.get_location()
+        visited: Set[Tuple[int, int]] = {start}
+        q = deque([(start, 0)])
+        best: Optional[Tuple[int, int]] = None
+        best_score = -1e9
+
+        while q:
+            loc, dist = q.popleft()
+            x, y = loc
+            visits = self.visit_counts[y, x] if 0 <= x < self.size and 0 <= y < self.size else 99
+            novelty = 1.0 if visits == 0 else (0.4 if visits == 1 else 0.0)
+            risk = self._risk_at(loc)
+            if novelty > 0.0 and risk <= 0.9:
+                enemy_dist = abs(loc[0] - enemy_loc[0]) + abs(loc[1] - enemy_loc[1])
+                score = 10.0 * novelty - 0.6 * dist - 0.35 * enemy_dist - 4.0 * risk
+                if score > best_score:
+                    best_score = score
+                    best = loc
+                    if novelty >= 1.0 and dist <= 3:
+                        break
+
+            for d in Direction:
+                nxt = loc_after_direction(loc, d)
+                if nxt in visited:
+                    continue
+                if not board.is_valid_cell(nxt):
+                    continue
+                if board.is_cell_blocked(nxt):
+                    continue
+                visited.add(nxt)
+                q.append((nxt, dist + 1))
+
+        return best
+
+    def _frontier_step_bonus(self, cur_loc: Tuple[int, int], next_loc: Tuple[int, int]) -> float:
+        if self.frontier_target is None:
+            return 0.0
+        target = self.frontier_target
+        cur_dist = abs(cur_loc[0] - target[0]) + abs(cur_loc[1] - target[1])
+        nxt_dist = abs(next_loc[0] - target[0]) + abs(next_loc[1] - target[1])
+        return 4.0 * (cur_dist - nxt_dist)
+
+    def _novelty_bonus(self, loc: Tuple[int, int]) -> float:
+        x, y = loc
+        if not (0 <= x < self.size and 0 <= y < self.size):
+            return 0.0
+        visits = int(self.visit_counts[y, x])
+        if visits == 0:
+            return 6.0
+        if visits == 1:
+            return 2.5
+        if visits == 2:
+            return 0.5
+        return -1.0 * (visits - 2)
+
+    def _coverage_penalty(self, loc: Tuple[int, int]) -> float:
+        x, y = loc
+        if 0 <= x < self.size and 0 <= y < self.size:
+            return float(self.visit_counts[y, x])
+        return 0.0
+
     # ---- Opening sweep expansion ----
     def _opening_sweep_move(
         self,
@@ -584,26 +717,33 @@ class PlayerAgent:
         # Evaluate runway in each direction
         best_dir = None
         best_score = -1e9
-        runway_info = {}
+        runway_info: Dict[Direction, Dict[str, float]] = {}
         for d in dirs:
-            steps, eggables, avg_risk = self._runway_stats(board, cur, d, max_steps=6)
+            steps, eggables, avg_risk, novel = self._runway_stats(board, cur, d, max_steps=6)
             # Prefer many eggable tiles and longer runway, penalize risk
-            score = 3.0 * eggables + 1.2 * steps - 2.5 * avg_risk
+            score = 3.0 * eggables + 1.2 * steps - 2.5 * avg_risk + 2.2 * novel
             # Small tie-break by how far from spawn this points
             nxt = loc_after_direction(cur, d)
             score += 0.2 * (abs(nxt[0] - self.spawn_loc[0]) + abs(nxt[1] - self.spawn_loc[1]))
-            runway_info[d] = (steps, eggables, avg_risk, score)
+            runway_info[d] = {
+                "steps": float(steps),
+                "eggables": float(eggables),
+                "avg_risk": avg_risk,
+                "novel": float(novel),
+                "score": score,
+            }
             if score > best_score:
                 best_score = score
                 best_dir = d
 
         # Consider a secondary dir if primary is too risky right now
-        sorted_dirs = sorted(dirs, key=lambda dd: runway_info[dd][3], reverse=True)
+        sorted_dirs = sorted(dirs, key=lambda dd: runway_info[dd]["score"], reverse=True)
         risk_cap = 0.8
 
         # Try up to two directions
         for candidate_dir in sorted_dirs[:2]:
-            steps, eggables, avg_risk, _ = runway_info[candidate_dir]
+            steps = runway_info[candidate_dir]["steps"]
+            avg_risk = runway_info[candidate_dir]["avg_risk"]
             if steps <= 0:
                 continue
             next_loc = loc_after_direction(cur, candidate_dir)
@@ -627,10 +767,11 @@ class PlayerAgent:
         start: Tuple[int, int],
         direction: Direction,
         max_steps: int = 6,
-    ) -> Tuple[int, int, float]:
+    ) -> Tuple[int, int, float, int]:
         steps = 0
         eggables = 0
         risks: List[float] = []
+        novel = 0
         loc = start
         parity = board.chicken_player.even_chicken
 
@@ -650,9 +791,12 @@ class PlayerAgent:
             if (nxt[0] + nxt[1]) % 2 == parity:
                 eggables += 1
             loc = nxt
+            if 0 <= nxt[0] < self.size and 0 <= nxt[1] < self.size:
+                if self.visit_counts[nxt[1], nxt[0]] == 0:
+                    novel += 1
 
         avg_risk = float(np.mean(risks)) if risks else 0.0
-        return steps, eggables, avg_risk
+        return steps, eggables, avg_risk, novel
 
     def _turd_pressure(self, board: Board, loc: Tuple[int, int]) -> float:
         enemy_loc = board.chicken_enemy.get_location()
