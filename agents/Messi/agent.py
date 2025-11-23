@@ -52,6 +52,9 @@ class PlayerAgent:
         self.frontier_refresh_turn: int = -1
         # Previous board position (to penalize immediate backtracks)
         self.prev_pos: Tuple[int, int] = self.spawn
+        # Loop prevention state
+        self.recent_positions: deque[Tuple[int, int]] = deque(maxlen=12)
+        self.stagnation_count: int = 0
         # Outward expansion aggressiveness
         self.outward_weight: float = 1.25
         # Cached flag set each turn in _order_moves
@@ -92,6 +95,23 @@ class PlayerAgent:
             self.moves_since_last_egg = 0
         else:
             self.moves_since_last_egg += 1
+        # Update loop/stagnation trackers
+        # Record current location in recent path if changed
+        if not self.recent_positions or self.recent_positions[-1] != cur_loc:
+            self.recent_positions.append(cur_loc)
+        # Predict next location and update stagnation pressure
+        nxt_loc = loc_after_direction(cur_loc, choice[0])
+        novelty_next = nxt_loc not in self.visited_tiles
+        try:
+            terr_cur = self._territory_diff_bfs(board, cur_loc, radius=5)
+            terr_nxt = self._territory_diff_bfs(board, nxt_loc, radius=5)
+            terr_delta = terr_nxt - terr_cur
+        except Exception:
+            terr_delta = 0
+        if novelty_next or terr_delta > 0:
+            self.stagnation_count = max(0, self.stagnation_count - 1)
+        else:
+            self.stagnation_count = min(8, self.stagnation_count + 1)
         # Update previous position (for anti-backtracking next turn)
         self.prev_pos = cur_loc
         return choice
@@ -243,10 +263,9 @@ class PlayerAgent:
         risk_here = self._risk_at(cur)
         risk_next = self._risk_at(next_loc)
         enemy_forecast = self._predict_enemy_next_loc(board)
-        enemy_forecast_adjacent = (
-            enemy_forecast is not None
-            and abs(next_loc[0] - enemy_forecast[0]) + abs(next_loc[1] - enemy_forecast[1]) == 1
-        )
+        # Compute current local territory once per call (for mode selection and deltas)
+        territory_cur_now = self._territory_diff_bfs(board, cur, radius=5)
+        mode = self._select_mode(board, territory_cur_now)
         eggs_self = board.chicken_player.get_eggs_laid()
         eggs_opp = board.chicken_enemy.get_eggs_laid()
         egg_diff = eggs_self - eggs_opp
@@ -279,6 +298,11 @@ class PlayerAgent:
                 # If a safe novel plain move exists, strongly de-prioritize egging
                 if self._safe_novel_exists:
                     base -= 18.0
+            # Mode adjustments: simplify priorities
+            if mode == "expand":
+                base -= 20.0
+            elif mode == "egg":
+                base += 12.0
             return base
 
         if mt == MoveType.TURD:
@@ -315,6 +339,10 @@ class PlayerAgent:
         # Lightweight cut-in trigger: move toward interior when we can egg soon
         next_is_eggable = board.can_lay_egg_at_loc(next_loc)
         egg_in_two = self._egg_in_two_steps(board, next_loc)
+        # Edge escape: encourage moving away from borders when cramped
+        cur_edge = self._distance_to_border(cur)
+        nxt_edge = self._distance_to_border(next_loc)
+        edge_escape = max(0, nxt_edge - cur_edge)
         cur_center_d = self._distance_to_center(cur)
         nxt_center_d = self._distance_to_center(next_loc)
         cut_in_bonus = 0.0
@@ -365,9 +393,17 @@ class PlayerAgent:
         base += path_pull
         base += outward_gain
         base += novelty + 2.2
-        frontier_wt = 7.2 if self.phase == "opening" else 6.2
+        # Stuck pressure increases frontier drive
+        stuck_pressure = min(1.0, float(self.stagnation_count) / 5.0)
+        frontier_wt = (7.2 if self.phase == "opening" else 6.2) + 2.0 * stuck_pressure
+        if mode == "expand":
+            frontier_wt += 2.0
+        elif mode == "egg":
+            frontier_wt += 0.8
         base += frontier_wt * frontier_step
         base += 2.0 * open_space
+        if mode == "expand":
+            base += 0.8 * novelty + 0.8 * open_space
         base += cut_in_bonus
         base += diag_bonus + sep_bonus + vor_bonus
         base += territory_contrib
@@ -376,19 +412,24 @@ class PlayerAgent:
             # Allow if it meaningfully improves territory under low risk
             if not (territory_delta > 2.0 and risk_next < 0.6):
                 base -= 10.0
-        # Intercept bonus: if we step adjacent to predicted enemy tile and we gain space
-        if enemy_forecast_adjacent and territory_delta > 0.0:
-            base += min(3.0, 1.0 + 0.5 * territory_delta)
         base -= 18.0 * risk_next
         # Extra penalty for proximity to enemy turds in opening (mobility preservation)
         if self.phase == "opening" and enemy_turds_near > 0:
             base -= min(8.0, 2.5 * enemy_turds_near) * (1.0 if branching <= 2 else 0.6)
         base -= 2.5 * dist_center
+        # Edge escape encouragement
+        if self.phase != "endgame":
+            base += 1.5 * float(edge_escape)
         # Delay plain moves that don't lead to near-term egg in the opening
         if self.phase == "opening":
             base -= 1.5 * future_egg
         else:
             base -= 1.8 * future_egg
+        # Mode-specific shaping
+        if mode == "cutoff":
+            base += 3.0 * choke + 1.5 * path_pull
+        elif mode == "egg":
+            base += 0.8 * future_egg  # soften anti-egg penalty when we want to egg
         # Corridor/dead-end awareness: discourage moving into dead-ends early unless it cuts off space or enables quick egg
         if self.phase == "opening" and branching <= 1:
             if not (territory_delta > 0.0 or egg_in_two):
@@ -405,13 +446,16 @@ class PlayerAgent:
                 if egg_in_two:
                     corner_plan += 1.2
                 base += corner_plan
-        # Discourage revisits, especially if a safe novel option exists
-        base -= 1.8 * coverage
+        # Discourage revisits, especially if a safe novel option exists; stronger when stagnating
+        base -= 1.8 * coverage * (1.0 + 0.4 * stuck_pressure)
         if self._safe_novel_exists and coverage >= 2.0:
             base -= 5.0
         # Avoid immediate backtracks to the previous position
         if next_loc == self.prev_pos:
             base -= 16.0
+        # Cycle avoidance: penalize re-entering short cycles (A-B-A, A-B-C-A) more when stagnating
+        cycle_pen = self._cycle_penalty(next_loc)
+        base -= min(12.0, cycle_pen * (1.0 + 0.5 * stuck_pressure))
         # Opening anti-regression: avoid moving back toward spawn or against lane
         if self.phase == "opening":
             reg_out = max(0, cur_out - nxt_out)
@@ -970,4 +1014,38 @@ class PlayerAgent:
         if value > hi:
             return hi
         return value
+    
+    def _cycle_penalty(self, next_loc: Tuple[int, int]) -> float:
+        """Return penalty for stepping back into a short cycle relative to recent positions."""
+        pen = 0.0
+        n = len(self.recent_positions)
+        if n >= 2 and self.recent_positions[-2] == next_loc:
+            pen += 6.0
+        if n >= 3 and self.recent_positions[-3] == next_loc:
+            pen += 3.0
+        # If the same tile appears frequently in recent path, add mild penalty
+        if n >= 6:
+            repeats = sum(1 for p in list(self.recent_positions)[-6:] if p == next_loc)
+            if repeats >= 2:
+                pen += 2.0
+        return pen
+    
+    def _distance_to_border(self, loc: Tuple[int, int]) -> int:
+        x, y = loc
+        return min(x, y, self.size - 1 - x, self.size - 1 - y)
+    
+    def _select_mode(self, board: Board, territory_cur: int) -> str:
+        """Pick a simple high-level mode to avoid competing heuristics."""
+        if self.phase == "endgame":
+            return "egg"
+        if self.phase == "opening":
+            if board.can_lay_egg() and self.moves_since_last_egg >= 2 and not self._safe_novel_exists:
+                return "egg"
+            return "expand"
+        # midgame
+        if self.stagnation_count >= 3 or territory_cur <= 0:
+            return "expand"
+        if board.can_lay_egg() and self.moves_since_last_egg >= 1:
+            return "egg"
+        return "cutoff"
 
