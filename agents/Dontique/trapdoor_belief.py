@@ -127,11 +127,11 @@ class TrapdoorBelief:
             ex, ey = self._known_even
             self.belief_even[ey, ex] = 1.0
         else:
-            even_count = int(even_mask.sum())
+        even_count = int(even_mask.sum())
             if even_count == 0:
-                valid_mask = even_mask | odd_mask
-                count = max(int(valid_mask.sum()), 1)
-                self.belief_even[valid_mask] = 1.0 / count
+            valid_mask = even_mask | odd_mask
+            count = max(int(valid_mask.sum()), 1)
+            self.belief_even[valid_mask] = 1.0 / count
             else:
                 self.belief_even[even_mask] = 1.0 / even_count
 
@@ -146,7 +146,7 @@ class TrapdoorBelief:
                 count = max(int(valid_mask.sum()), 1)
                 self.belief_odd[valid_mask] = 1.0 / count
             else:
-                self.belief_odd[odd_mask] = 1.0 / odd_count
+            self.belief_odd[odd_mask] = 1.0 / odd_count
 
         self._initialized = True
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from collections import deque
-from typing import Callable, List, Optional, Sequence, Tuple
+from typing import Callable, List, Optional, Sequence, Tuple, Set
 
 import numpy as np
 
@@ -45,6 +45,17 @@ class PlayerAgent:
         )
         self._opening_script = self._build_opening_script()
         self.loop_targets = self._build_loop_targets()
+        # Exploration state
+        self.visit_counts = np.zeros((self.size, self.size), dtype=np.uint8)
+        self.visited_tiles: Set[Tuple[int, int]] = {self.spawn}
+        self.frontier_target: Optional[Tuple[int, int]] = None
+        self.frontier_refresh_turn: int = -1
+        # Previous board position (to penalize immediate backtracks)
+        self.prev_pos: Tuple[int, int] = self.spawn
+        # Outward expansion aggressiveness
+        self.outward_weight: float = 1.25
+        # Cached flag set each turn in _order_moves
+        self._safe_novel_exists: bool = False
 
     # ------------------------------------------------------------------ #
     # Public API
@@ -59,6 +70,10 @@ class PlayerAgent:
         self.trap_belief.update(board.chicken_player, sensor_data)
         self._update_phase(board)
         self._risk_grid = self._build_risk_grid(board)
+        # Exploration bookkeeping
+        cur_loc = board.chicken_player.get_location()
+        self._record_visit(cur_loc)
+        self._maybe_refresh_frontier(board)
 
         legal_moves = board.get_valid_moves()
         if not legal_moves:
@@ -77,6 +92,8 @@ class PlayerAgent:
             self.moves_since_last_egg = 0
         else:
             self.moves_since_last_egg += 1
+        # Update previous position (for anti-backtracking next turn)
+        self.prev_pos = cur_loc
         return choice
 
     # ------------------------------------------------------------------ #
@@ -106,8 +123,7 @@ class PlayerAgent:
         self, board: Board, legal_moves: Sequence[Tuple[Direction, MoveType]]
     ) -> int:
         depth = 3
-        if board.turn_count < 3:
-            depth = 2
+        # Keep depth >=3 even on very early turns to better foresee cutoffs
         if self.phase == "endgame":
             depth += 1
         if len(legal_moves) <= 4:
@@ -124,7 +140,21 @@ class PlayerAgent:
     def _order_moves(
         self, board: Board, legal_moves: Sequence[Tuple[Direction, MoveType]]
     ) -> List[Tuple[Direction, MoveType]]:
-        scored = []
+        # Compute if there exists a safe novel plain move this turn
+        self._safe_novel_exists = False
+        cur = board.chicken_player.get_location()
+        for dir_, mt in legal_moves:
+            if mt != MoveType.PLAIN:
+                continue
+            nxt = loc_after_direction(cur, dir_)
+            if not board.is_valid_cell(nxt):
+                continue
+            # Prefer truly novel, reasonably safe tiles
+            if self._risk_at(nxt) <= 0.85 and int(self.visit_counts[nxt[1], nxt[0]]) == 0:
+                self._safe_novel_exists = True
+                break
+
+        scored: List[Tuple[float, Tuple[Direction, MoveType]]] = []
         for move in legal_moves:
             scored.append((self._score_move(board, move), move))
         scored.sort(key=lambda x: x[0], reverse=True)
@@ -212,13 +242,19 @@ class PlayerAgent:
         next_loc = loc_after_direction(cur, dir_)
         risk_here = self._risk_at(cur)
         risk_next = self._risk_at(next_loc)
+        enemy_forecast = self._predict_enemy_next_loc(board)
+        enemy_forecast_adjacent = (
+            enemy_forecast is not None
+            and abs(next_loc[0] - enemy_forecast[0]) + abs(next_loc[1] - enemy_forecast[1]) == 1
+        )
         eggs_self = board.chicken_player.get_eggs_laid()
         eggs_opp = board.chicken_enemy.get_eggs_laid()
         egg_diff = eggs_self - eggs_opp
         dist_center = self._distance_to_center(next_loc)
+        # No special blotch repulsion here; handled via risk grid
 
         if mt == MoveType.EGG:
-            base = 120.0
+            base = 110.0
             if self.moves_since_last_egg >= 2:
                 base += 15.0
             elif self.moves_since_last_egg >= 1:
@@ -230,6 +266,19 @@ class PlayerAgent:
             base -= 25.0 * max(0.0, risk_next - 0.5)
             base -= 3.0 * dist_center
             base += 6.0 * max(0, -egg_diff)
+            # Favor parity-correct eggs and novelty of current tile
+            if self._is_my_parity(cur):
+                base += 6.0
+            base += 2.5 * self._novelty_bonus(cur)
+            # Opening throttling: prioritize coverage over early egg spam
+            if self.phase == "opening":
+                base -= 32.0
+                # Require spacing between eggs in the opening
+                if self.moves_since_last_egg < 2:
+                    base -= (22.0 - 8.0 * self.moves_since_last_egg)
+                # If a safe novel plain move exists, strongly de-prioritize egging
+                if self._safe_novel_exists:
+                    base -= 18.0
             return base
 
         if mt == MoveType.TURD:
@@ -248,14 +297,144 @@ class PlayerAgent:
         choke = self._enemy_choke_bonus(board, next_loc)
         path_pull = self._path_progress(board, next_loc)
         parity_bonus = 12.0 if self._is_my_parity(next_loc) else 0.0
+        # Outward expansion from spawn
+        sx, sy = self.spawn
+        cur_out = abs(cur[0] - sx) + abs(cur[1] - sy)
+        nxt_out = abs(next_loc[0] - sx) + abs(next_loc[1] - sy)
+        outward_gain_multiplier = 1.9 if self.phase == "opening" else 1.0
+        outward_gain = self.outward_weight * outward_gain_multiplier * (nxt_out - cur_out)
+        # Exploration incentives
+        novelty = self._novelty_bonus(next_loc)
+        frontier_step = self._frontier_step_bonus(cur, next_loc)
+        coverage = self._coverage_penalty(next_loc)
+        branching = self._branching_factor(board, next_loc)
+        # Enemy turd proximity (radius-2)
+        enemy_turds_near = self._count_enemy_turds_within(board, next_loc, radius=2)
+        # Local open space (radius-2)
+        open_space = self._local_open_space(board, next_loc)
+        # Lightweight cut-in trigger: move toward interior when we can egg soon
+        next_is_eggable = board.can_lay_egg_at_loc(next_loc)
+        egg_in_two = self._egg_in_two_steps(board, next_loc)
+        cur_center_d = self._distance_to_center(cur)
+        nxt_center_d = self._distance_to_center(next_loc)
+        cut_in_bonus = 0.0
+        if nxt_center_d < cur_center_d and (next_is_eggable or egg_in_two):
+            cut_in_bonus = 2.3 + (0.7 if (egg_in_two and not next_is_eggable) else 0.0)
+        # Removed heavy global region and immediate mobility shaping to restore prior strong behavior
+        # Opening diagonal sweep: aim toward best corner away from enemy to sweep and flank
+        diag_bonus = 0.0
+        sep_bonus_raw = 0.0
+        vor_bonus_raw = 0.0
+        if self.phase == "opening":
+            corner = self._best_diagonal_corner(board)
+            cur_d_corner = self._manhattan(cur, corner)
+            nxt_d_corner = self._manhattan(next_loc, corner)
+            diag_bonus = 3.0 * float(cur_d_corner - nxt_d_corner)
+            enemy_loc = board.chicken_enemy.get_location()
+            sep_now = self._manhattan(cur, enemy_loc)
+            sep_next = self._manhattan(next_loc, enemy_loc)
+            sep_bonus_raw = 0.6 * float(sep_next - sep_now)
+            vor_bonus_raw = 0.2 * float(self._local_voronoi_advantage(board, next_loc, radius=5))
+        # Stronger local territory (BFS Voronoi) bonus to push cutoffs/coverage
+        territory_adv = self._territory_diff_bfs(board, next_loc, radius=5)
+        territory_cur = self._territory_diff_bfs(board, cur, radius=5)
+        territory_delta = float(territory_adv - territory_cur)
+        if self.phase == "opening":
+            territory_weight = 0.45
+        elif self.phase == "midgame":
+            territory_weight = 0.35
+        else:
+            territory_weight = 0.25
+        # Gate separation: only reward separation when it increases our territory
+        sep_bonus = sep_bonus_raw if territory_delta > 0.0 else 0.0
+        # Add explicit reward for improving territory vs current
+        delta_weight = 0.6 if self.phase == "opening" else (0.35 if self.phase == "midgame" else 0.25)
+        # Harmonize: clamp territory metrics and risk-modulate their influence
+        t_adv = self._clamp(float(territory_adv), -8.0, 8.0)
+        t_delta = self._clamp(float(territory_delta), -4.0, 4.0)
+        risk_scale = 1.0 / (1.0 + 2.0 * max(0.0, risk_next - 0.2))
+        territory_contrib = risk_scale * (territory_weight * t_adv + delta_weight * max(0.0, t_delta))
+        territory_contrib = self._clamp(territory_contrib, -6.0, 6.0)
+        # Harmonize: if BFS territory is already strong, damp local Voronoi bonus to avoid double counting
+        vor_bonus = 0.0 if abs(t_adv) >= 4.0 else 0.5 * vor_bonus_raw
 
         base = 32.0 + parity_bonus
         base += 5.0 * lane_progress
-        base += 7.0 * choke
+        # Stronger choke to encourage cutoffs and separation
+        base += 9.5 * choke
         base += path_pull
+        base += outward_gain
+        base += novelty + 2.2
+        frontier_wt = 7.2 if self.phase == "opening" else 6.2
+        base += frontier_wt * frontier_step
+        base += 2.0 * open_space
+        base += cut_in_bonus
+        base += diag_bonus + sep_bonus + vor_bonus
+        base += territory_contrib
+        # Collision avoidance: penalize stepping into predicted enemy next tile
+        if enemy_forecast is not None and next_loc == enemy_forecast:
+            # Allow if it meaningfully improves territory under low risk
+            if not (territory_delta > 2.0 and risk_next < 0.6):
+                base -= 10.0
+        # Intercept bonus: if we step adjacent to predicted enemy tile and we gain space
+        if enemy_forecast_adjacent and territory_delta > 0.0:
+            base += min(3.0, 1.0 + 0.5 * territory_delta)
         base -= 18.0 * risk_next
+        # Extra penalty for proximity to enemy turds in opening (mobility preservation)
+        if self.phase == "opening" and enemy_turds_near > 0:
+            base -= min(8.0, 2.5 * enemy_turds_near) * (1.0 if branching <= 2 else 0.6)
         base -= 2.5 * dist_center
-        base -= 4.0 * future_egg
+        # Delay plain moves that don't lead to near-term egg in the opening
+        if self.phase == "opening":
+            base -= 1.5 * future_egg
+        else:
+            base -= 1.8 * future_egg
+        # Corridor/dead-end awareness: discourage moving into dead-ends early unless it cuts off space or enables quick egg
+        if self.phase == "opening" and branching <= 1:
+            if not (territory_delta > 0.0 or egg_in_two):
+                base -= 6.0
+        # Corner approach planning: encourage stepping into a safe, novel corner we can soon egg
+        if (
+            mt == MoveType.PLAIN
+            and self.phase == "opening"
+            and self._is_corner(next_loc)
+            and risk_next < 0.75
+        ):
+            if next_loc not in board.eggs_player and next_loc not in board.turds_player and next_loc not in board.turds_enemy:
+                corner_plan = 1.5 + 1.0 * self._novelty_bonus(next_loc)
+                if egg_in_two:
+                    corner_plan += 1.2
+                base += corner_plan
+        # Discourage revisits, especially if a safe novel option exists
+        base -= 1.8 * coverage
+        if self._safe_novel_exists and coverage >= 2.0:
+            base -= 5.0
+        # Avoid immediate backtracks to the previous position
+        if next_loc == self.prev_pos:
+            base -= 16.0
+        # Opening anti-regression: avoid moving back toward spawn or against lane
+        if self.phase == "opening":
+            reg_out = max(0, cur_out - nxt_out)
+            reg_lane = max(0.0, -lane_progress)
+            if (reg_out > 0 or reg_lane > 0) and not (risk_next + 0.15 < risk_here):
+                base -= 10.0 + 6.0 * (reg_out + reg_lane)
+            if board.turn_count <= 3 and (reg_out > 0 or reg_lane > 0) and not (risk_next + 0.05 < risk_here):
+                base -= 10.0
+        # Heading inertia: mildly prefer continuing current heading to avoid oscillation
+        if mt == MoveType.PLAIN and self.prev_pos != cur:
+            dx = cur[0] - self.prev_pos[0]
+            dy = cur[1] - self.prev_pos[1]
+            last_dir: Optional[Direction] = None
+            if dx == 1 and dy == 0:
+                last_dir = Direction.RIGHT
+            elif dx == -1 and dy == 0:
+                last_dir = Direction.LEFT
+            elif dx == 0 and dy == 1:
+                last_dir = Direction.DOWN
+            elif dx == 0 and dy == -1:
+                last_dir = Direction.UP
+            if last_dir is not None and dir_ == last_dir:
+                base += 0.8
         return base
 
     def _score_enemy_move(self, board: Board, move: Tuple[Direction, MoveType]) -> float:
@@ -275,7 +454,8 @@ class PlayerAgent:
 
         target = self._enemy_lane_target(board)
         dist = self._manhattan(next_loc, target)
-        return 28.0 - 2.8 * dist - 22.0 * risk
+        terr_adv = self._territory_diff_bfs(board, next_loc, radius=5)
+        return 28.0 - 2.8 * dist - 22.0 * risk + 0.3 * float(terr_adv)
 
     # ------------------------------------------------------------------ #
     # Evaluation
@@ -303,6 +483,7 @@ class PlayerAgent:
     # ------------------------------------------------------------------ #
     # Opening guidance
     # ------------------------------------------------------------------ #
+
     def _opening_move(
         self, board: Board, legal_moves: Sequence[Tuple[Direction, MoveType]]
     ) -> Optional[Tuple[Direction, MoveType]]:
@@ -342,6 +523,8 @@ class PlayerAgent:
     def _register_known_trapdoors(self, board: Board) -> None:
         for loc in getattr(board, "found_trapdoors", set()):
             self.trap_belief.register_known_trapdoor(loc)
+    
+    # Removed perimeter orientation and hazard-distance helpers to restore prior behavior
 
     def _update_phase(self, board: Board) -> None:
         if board.turn_count < self.OPENING_TURNS:
@@ -383,6 +566,189 @@ class PlayerAgent:
             grid[ty, tx] += 0.4
         return grid
 
+    # ------------------------------------------------------------------ #
+    # Exploration helpers
+    # ------------------------------------------------------------------ #
+    def _record_visit(self, loc: Tuple[int, int]) -> None:
+        x, y = loc
+        if 0 <= x < self.size and 0 <= y < self.size:
+            self.visit_counts[y, x] = min(255, self.visit_counts[y, x] + 1)
+            self.visited_tiles.add(loc)
+
+    def _maybe_refresh_frontier(self, board: Board) -> None:
+        # Refresh if no target, already reached, or stale
+        if (
+            self.frontier_target is None
+            or self.frontier_target in self.visited_tiles
+            or board.turn_count >= self.frontier_refresh_turn
+        ):
+            self.frontier_target = self._compute_frontier_target(board)
+            self.frontier_refresh_turn = board.turn_count + 6
+
+    def _compute_frontier_target(self, board: Board) -> Optional[Tuple[int, int]]:
+        start = board.chicken_player.get_location()
+        best_target: Optional[Tuple[int, int]] = None
+        best_score = -1e9
+        seen = set([start])
+        q: deque[Tuple[Tuple[int, int], int]] = deque([(start, 0)])
+        max_depth = 18
+        center = (self.size - 1) / 2.0
+        sx, sy = self.spawn
+        while q:
+            loc, dist = q.popleft()
+            if dist > max_depth:
+                continue
+            x, y = loc
+            if not self._in_bounds(loc):
+                continue
+            # Scoring: prefer novel tiles, closer distance, lower risk
+            visits = int(self.visit_counts[y, x])
+            novelty = 3.0 / (1.0 + visits)
+            risk = self._risk_at(loc)
+            center_dist = abs(x - center) + abs(y - center)
+            outward = abs(x - sx) + abs(y - sy)
+            score = 6.0 * novelty - 0.3 * dist - 0.6 * risk
+            # Opening bias: nudge toward centerline and outward expansion
+            if self.phase == "opening":
+                score += -0.12 * center_dist + 0.05 * outward
+            if score > best_score:
+                best_score = score
+                best_target = loc
+            for dir_ in Direction:
+                nxt = loc_after_direction(loc, dir_)
+                if nxt in seen:
+                    continue
+                if not board.is_valid_cell(nxt):
+                    continue
+                seen.add(nxt)
+                q.append((nxt, dist + 1))
+        return best_target
+
+    def _novelty_bonus(self, loc: Tuple[int, int]) -> float:
+        x, y = loc
+        if 0 <= x < self.size and 0 <= y < self.size:
+            v = int(self.visit_counts[y, x])
+            return 3.0 / (1.0 + v)
+        return 0.0
+
+    def _coverage_penalty(self, loc: Tuple[int, int]) -> float:
+        x, y = loc
+        if 0 <= x < self.size and 0 <= y < self.size:
+            v = int(self.visit_counts[y, x])
+            if v == 0:
+                return 0.0
+            if v == 1:
+                return 1.0
+            return 2.0
+        return 0.0
+
+    def _frontier_step_bonus(self, cur: Tuple[int, int], nxt: Tuple[int, int]) -> float:
+        if self.frontier_target is None:
+            return 0.0
+        cur_d = abs(cur[0] - self.frontier_target[0]) + abs(cur[1] - self.frontier_target[1])
+        nxt_d = abs(nxt[0] - self.frontier_target[0]) + abs(nxt[1] - self.frontier_target[1])
+        return max(0.0, float(cur_d - nxt_d))
+
+    def _local_open_space(self, board: Board, loc: Tuple[int, int]) -> float:
+        # Count nearby accessible cells within manhattan radius 2
+        count = 0
+        total = 0
+        x0, y0 = loc
+        for dx in range(-2, 3):
+            for dy in range(-2, 3):
+                if abs(dx) + abs(dy) > 2:
+                    continue
+                x, y = x0 + dx, y0 + dy
+                if not self._in_bounds((x, y)):
+                    continue
+                total += 1
+                if not board.is_cell_blocked((x, y)):
+                    count += 1
+        if total == 0:
+            return 0.0
+        # Normalize around [0, ~1]
+        return (count / total)
+    
+    def _local_voronoi_advantage(self, board: Board, loc: Tuple[int, int], radius: int = 5) -> int:
+        """Approximate local territory advantage: cells closer to us than enemy within a radius."""
+        ex, ey = board.chicken_enemy.get_location()
+        lx, ly = loc
+        score = 0
+        for dx in range(-radius, radius + 1):
+            for dy in range(-radius, radius + 1):
+                if abs(dx) + abs(dy) > radius:
+                    continue
+                x = lx + dx
+                y = ly + dy
+                if not self._in_bounds((x, y)):
+                    continue
+                if board.is_cell_blocked((x, y)):
+                    continue
+                d_self = abs(dx) + abs(dy)
+                d_enemy = abs(x - ex) + abs(y - ey)
+                if d_self < d_enemy:
+                    score += 1
+                elif d_self > d_enemy:
+                    score -= 1
+        return score
+    
+    def _bfs_dist_map(self, board: Board, start: Tuple[int, int], radius: int) -> dict:
+        """Compute BFS distances from start up to a given manhattan radius on passable cells."""
+        dist = {start: 0}
+        q = deque([start])
+        while q:
+            loc = q.popleft()
+            d = dist[loc]
+            if d >= radius:
+                continue
+            for dir_ in Direction:
+                nxt = loc_after_direction(loc, dir_)
+                if not self._in_bounds(nxt):
+                    continue
+                if board.is_cell_blocked(nxt):
+                    continue
+                if nxt in dist:
+                    continue
+                dist[nxt] = d + 1
+                q.append(nxt)
+        return dist
+    
+    def _territory_diff_bfs(self, board: Board, origin: Tuple[int, int], radius: int = 5) -> int:
+        """Approximate local territory difference using BFS-based Voronoi within a radius."""
+        self_map = self._bfs_dist_map(board, origin, radius)
+        enemy_loc = board.chicken_enemy.get_location()
+        enemy_map = self._bfs_dist_map(board, enemy_loc, radius)
+        ox, oy = origin
+        score = 0
+        for dx in range(-radius, radius + 1):
+            for dy in range(-radius, radius + 1):
+                if abs(dx) + abs(dy) > radius:
+                    continue
+                x = ox + dx
+                y = oy + dy
+                if not self._in_bounds((x, y)):
+                    continue
+                if board.is_cell_blocked((x, y)):
+                    continue
+                ds = self_map.get((x, y))
+                de = enemy_map.get((x, y))
+                if ds is None and de is None:
+                    continue
+                if de is None:
+                    score += 1
+                elif ds is None:
+                    score -= 1
+                else:
+                    if ds < de:
+                        score += 1
+                    elif ds > de:
+                        score -= 1
+        return score
+    
+    # (Local Voronoi advantage helper removed to restore earlier behavior)
+
+    # (Open-region, mobility, and blotch-specific helpers removed in revert)
+
     def _risk_at(self, loc: Tuple[int, int]) -> float:
         x, y = loc
         if 0 <= x < self.size and 0 <= y < self.size:
@@ -392,6 +758,22 @@ class PlayerAgent:
     def _distance_to_center(self, loc: Tuple[int, int]) -> float:
         center = (self.size - 1) / 2.0
         return abs(loc[0] - center) + abs(loc[1] - center)
+    
+    def _best_diagonal_corner(self, board: Board) -> Tuple[int, int]:
+        """Choose a corner target that is far from enemy and reasonably far from us to sweep toward."""
+        corners = [(0, 0), (self.size - 1, 0), (0, self.size - 1), (self.size - 1, self.size - 1)]
+        cur = board.chicken_player.get_location()
+        enemy = board.chicken_enemy.get_location()
+        best = corners[0]
+        best_score = -1e9
+        for cx, cy in corners:
+            dist_enemy = abs(cx - enemy[0]) + abs(cy - enemy[1])
+            dist_cur = abs(cx - cur[0]) + abs(cy - cur[1])
+            score = 1.0 * dist_enemy + 0.5 * dist_cur
+            if score > best_score:
+                best_score = score
+                best = (cx, cy)
+        return best
 
     def _lane_progress(self, cur: Tuple[int, int], nxt: Tuple[int, int]) -> float:
         if self._lane_dir in (Direction.RIGHT, Direction.LEFT):
@@ -404,6 +786,21 @@ class PlayerAgent:
         if board.can_lay_egg_at_loc(loc):
             return 1.0
         return 2.0
+    
+    def _egg_in_two_steps(self, board: Board, origin: Tuple[int, int]) -> bool:
+        """Return True if from origin we can reach an eggable tile in <=2 moves.
+        Uses simple neighbor scan without simulating enemy responses."""
+        if board.can_lay_egg_at_loc(origin):
+            return True
+        for dir_ in Direction:
+            nxt = loc_after_direction(origin, dir_)
+            if not self._in_bounds(nxt):
+                continue
+            if board.is_cell_blocked(nxt):
+                continue
+            if board.can_lay_egg_at_loc(nxt):
+                return True
+        return False
 
     def _path_progress(self, board: Board, loc: Tuple[int, int]) -> float:
         best = 0.0
@@ -431,6 +828,14 @@ class PlayerAgent:
         choke = 0.0
         if dist <= 2:
             choke += 3.0 - dist
+        # Corridor awareness: more valuable if current tile is a corridor/low-branching point
+        branching_here = self._branching_factor(board, loc)
+        corridor_bonus = 0.0
+        if branching_here <= 1:
+            corridor_bonus += 1.4
+        elif branching_here == 2:
+            corridor_bonus += 0.6
+        # Local lane availability (unchanged base, scaled a bit)
         lanes = 0.0
         for dir_ in Direction:
             nxt = loc_after_direction(loc, dir_)
@@ -438,8 +843,10 @@ class PlayerAgent:
                 continue
             if nxt in board.turds_player or nxt in board.turds_enemy:
                 continue
-            lanes += 0.3
-        return choke + lanes
+            lanes += 0.25
+        # More valuable if within moderate range of enemy (threat window)
+        proximity = max(0.0, 3.0 - min(3.0, float(dist)))
+        return choke + lanes + corridor_bonus + 0.4 * proximity
 
     def _lane_distance(self, loc: Tuple[int, int]) -> int:
         target_x = self.size - 1 if self.spawn[0] == 0 else 0
@@ -486,6 +893,46 @@ class PlayerAgent:
                 visited.add(nxt)
                 q.append((nxt, steps + 1))
         return score * 0.25
+    
+    def _branching_factor(self, board: Board, loc: Tuple[int, int]) -> int:
+        """Count passable immediate neighbors. Low branching implies corridors/dead-ends."""
+        cnt = 0
+        for dir_ in Direction:
+            nxt = loc_after_direction(loc, dir_)
+            if not self._in_bounds(nxt):
+                continue
+            if board.is_cell_blocked(nxt):
+                continue
+            cnt += 1
+        return cnt
+    
+    def _count_enemy_turds_within(self, board: Board, loc: Tuple[int, int], radius: int = 2) -> int:
+        x0, y0 = loc
+        count = 0
+        for dx in range(-radius, radius + 1):
+            for dy in range(-radius, radius + 1):
+                if abs(dx) + abs(dy) > radius:
+                    continue
+                x = x0 + dx
+                y = y0 + dy
+                if not self._in_bounds((x, y)):
+                    continue
+                if (x, y) in board.turds_enemy:
+                    count += 1
+        return count
+    
+    def _predict_enemy_next_loc(self, board: Board) -> Optional[Tuple[int, int]]:
+        """One-ply enemy forecast from current state using enemy policy (territory-aware)."""
+        try:
+            sim = board.get_copy()
+            sim.reverse_perspective()
+            mv = self._enemy_policy(sim, horizon=1)
+            if mv is None:
+                return None
+            enemy_cur = board.chicken_enemy.get_location()
+            return loc_after_direction(enemy_cur, mv[0])
+        except Exception:
+            return None
 
     def _available_sites(self, board: Board, friendly: bool) -> int:
         parity = self.my_parity if friendly else self.enemy_parity
@@ -516,4 +963,11 @@ class PlayerAgent:
 
     def _is_my_parity(self, loc: Tuple[int, int]) -> bool:
         return (loc[0] + loc[1]) % 2 == self.my_parity
+    
+    def _clamp(self, value: float, lo: float, hi: float) -> float:
+        if value < lo:
+            return lo
+        if value > hi:
+            return hi
+        return value
 

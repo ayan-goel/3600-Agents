@@ -854,7 +854,7 @@ class PlayerAgent:
             if board.can_lay_egg() and ((candidate_dir, MoveType.EGG) in legal):
                 # Only skip if extremely risky
                 if next_risk <= 0.7:
-                    return (candidate_dir, MoveType.EGG)
+                return (candidate_dir, MoveType.EGG)
 
             # Otherwise, move plain along the candidate_dir if legal, to set up next egg
             if (candidate_dir, MoveType.PLAIN) in legal:
