@@ -2,10 +2,10 @@ from typing import List, Tuple
 
 import numpy as np
 
-from .chicken import Chicken
-from .enums import Cell, Direction, MoveType, Result, WinReason
-from .game_map import GameMap, prob_feel, prob_hear
-from .history import History
+from game.chicken import Chicken
+from game.enums import Cell, Direction, MoveType, Result, WinReason
+from game.game_map import GameMap, prob_feel, prob_hear
+from game.history import History
 
 
 def delta_locs(loc_a: Tuple[int, int], loc_b: Tuple[int, int]) -> Tuple[int, int]:
@@ -38,17 +38,17 @@ class TrapdoorManager:
             print("ERROR: choose_spawns called twice")
         dim = self.game_map.MAP_SIZE
 
+        # Not a corner
+        y1 = np.random.randint(1, dim - 1)
+        y2 = y1
+
         # Left edge or right
-        if np.random.random() < 0.5:
+        if y1 % 2 == 0:
             x1 = 0
             x2 = dim - 1
         else:
             x1 = dim - 1
             x2 = 0
-
-        # Not a corner
-        y1 = np.random.randint(1, dim - 1)
-        y2 = y1
 
         self.spawns = [(x1, y1), (x2, y2)]
 

@@ -90,6 +90,23 @@ class PlayerAgent:
                 choice = self._select_move(board, legal_moves, time_left)
             except SearchTimeout:
                 choice = self._fast_greedy(board, legal_moves)
+        
+        # HARD OSCILLATION OVERRIDE: if we're stuck bouncing between 2 tiles,
+        # force a move that goes to a DIFFERENT tile
+        if len(self.recent_positions) >= 6:
+            recent = list(self.recent_positions)[-6:]
+            unique_tiles = set(recent)
+            if len(unique_tiles) <= 2:
+                # We're oscillating! Find ANY move that escapes
+                next_loc = loc_after_direction(cur_loc, choice[0])
+                if next_loc in unique_tiles:
+                    # Current choice stays in oscillation - find escape
+                    for mv in legal_moves:
+                        escape_loc = loc_after_direction(cur_loc, mv[0])
+                        if escape_loc not in unique_tiles and board.is_valid_cell(escape_loc):
+                            if not board.is_cell_blocked(escape_loc):
+                                choice = mv
+                                break
 
         if choice[1] == MoveType.EGG:
             self.moves_since_last_egg = 0
@@ -266,6 +283,9 @@ class PlayerAgent:
         # Compute current local territory once per call (for mode selection and deltas)
         territory_cur_now = self._territory_diff_bfs(board, cur, radius=5)
         mode = self._select_mode(board, territory_cur_now)
+        nearest_egg_cur = 1
+        if self.phase != "opening":
+            nearest_egg_cur = self._nearest_egg_distance(board, cur, limit=6)
         eggs_self = board.chicken_player.get_eggs_laid()
         eggs_opp = board.chicken_enemy.get_eggs_laid()
         egg_diff = eggs_self - eggs_opp
@@ -339,6 +359,24 @@ class PlayerAgent:
         # Lightweight cut-in trigger: move toward interior when we can egg soon
         next_is_eggable = board.can_lay_egg_at_loc(next_loc)
         egg_in_two = self._egg_in_two_steps(board, next_loc)
+        nearest_egg_steps = 1
+        nearest_egg_cur = 1
+        if self.phase != "opening":
+            nearest_egg_steps = self._nearest_egg_distance(board, next_loc, limit=6)
+            nearest_egg_cur = self._nearest_egg_distance(board, cur, limit=6)
+        # Egg opportunity seeking: in mid/endgame, reward moving closer to egg tiles
+        egg_seek_bonus = 0.0
+        if self.phase != "opening" and self.moves_since_last_egg >= 2:
+            # Reward getting closer to eggable tiles
+            egg_improvement = nearest_egg_cur - nearest_egg_steps
+            if egg_improvement > 0:
+                egg_seek_bonus = 3.0 * egg_improvement
+            # Extra bonus if we're far from any egg opportunity and moving toward one
+            if nearest_egg_cur >= 4 and egg_improvement > 0:
+                egg_seek_bonus += 4.0
+            # Bonus for moving to an immediately eggable tile
+            if next_is_eggable and nearest_egg_cur >= 2:
+                egg_seek_bonus += 5.0
         # Edge escape: encourage moving away from borders when cramped
         cur_edge = self._distance_to_border(cur)
         nxt_edge = self._distance_to_border(next_loc)
@@ -385,6 +423,59 @@ class PlayerAgent:
         territory_contrib = self._clamp(territory_contrib, -6.0, 6.0)
         # Harmonize: if BFS territory is already strong, damp local Voronoi bonus to avoid double counting
         vor_bonus = 0.0 if abs(t_adv) >= 4.0 else 0.5 * vor_bonus_raw
+        escape_bonus = 0.0
+        escape_pressure = 0.0
+        escape_egg_delta = 0.0
+        # Detect oscillation early to boost escape
+        oscillating = False
+        if len(self.recent_positions) >= 4:
+            recent_unique = set(list(self.recent_positions)[-6:])
+            oscillating = len(recent_unique) <= 2
+        if self.phase != "opening":
+            stagnating = self.stagnation_count >= 3
+            egg_starved = (self.moves_since_last_egg >= 3) and not board.can_lay_egg()
+            egg_far = nearest_egg_steps > 3
+            cramped = open_space < 0.55 and branching <= 1
+            # Detect saturated area: no eggs nearby, need to explore
+            saturated_area = nearest_egg_cur >= 4 and not board.can_lay_egg()
+            if stagnating and nearest_egg_cur > 2:
+                escape_pressure += 0.6
+            if egg_starved:
+                escape_pressure += 0.6
+            if egg_far:
+                escape_pressure += 0.5
+            if cramped:
+                escape_pressure += 0.4
+            if oscillating:
+                escape_pressure += 1.0  # Strong push to escape oscillation
+            if saturated_area:
+                escape_pressure += 0.8  # Push to find new egg areas
+            escape_pressure = min(2.0, escape_pressure)
+            if escape_pressure > 0.0:
+                inward = 1.0 if nxt_center_d < cur_center_d else 0.0
+                away_from_edge = max(0.0, float(nxt_edge - cur_edge))
+                egg_delta = max(0.0, float(nearest_egg_cur - nearest_egg_steps))
+                escape_bonus += escape_pressure * (
+                    3.0 * frontier_step + 1.8 * novelty + 1.2 * away_from_edge + 1.5 * inward
+                )
+                if egg_delta > 0.0:
+                    escape_bonus += 2.4 * escape_pressure * egg_delta
+                    escape_egg_delta = egg_delta
+                if coverage >= 1.0 and frontier_step == 0.0 and novelty < 0.5:
+                    escape_bonus -= 1.6 * coverage * escape_pressure
+                if coverage >= 2.0:
+                    escape_bonus -= 1.0 * escape_pressure
+                # When oscillating, strongly prefer any tile that breaks out
+                if oscillating:
+                    if novelty > 0.5:
+                        escape_bonus += 15.0
+                    # Even non-novel tiles that aren't in the oscillation set are good
+                    osc_tiles = set(list(self.recent_positions)[-8:])
+                    if next_loc not in osc_tiles:
+                        escape_bonus += 20.0
+                    # Reward moving toward center/open areas when stuck on edge
+                    if cur_edge <= 1 and nxt_edge > cur_edge:
+                        escape_bonus += 8.0
 
         base = 32.0 + parity_bonus
         base += 5.0 * lane_progress
@@ -406,7 +497,9 @@ class PlayerAgent:
             base += 0.8 * novelty + 0.8 * open_space
         base += cut_in_bonus
         base += diag_bonus + sep_bonus + vor_bonus
+        base += escape_bonus
         base += territory_contrib
+        base += egg_seek_bonus
         # Collision avoidance: penalize stepping into predicted enemy next tile
         if enemy_forecast is not None and next_loc == enemy_forecast:
             # Allow if it meaningfully improves territory under low risk
@@ -420,6 +513,12 @@ class PlayerAgent:
         # Edge escape encouragement
         if self.phase != "endgame":
             base += 1.5 * float(edge_escape)
+        # Strong edge-stuck escape: if we've been on border and oscillating, push hard inward
+        if oscillating and cur_edge <= 1:
+            if nxt_edge > cur_edge:
+                base += 15.0  # Strong reward for moving away from edge
+            elif nxt_edge <= cur_edge:
+                base -= 8.0  # Penalty for staying on edge while oscillating
         # Delay plain moves that don't lead to near-term egg in the opening
         if self.phase == "opening":
             base -= 1.5 * future_egg
@@ -450,12 +549,19 @@ class PlayerAgent:
         base -= 1.8 * coverage * (1.0 + 0.4 * stuck_pressure)
         if self._safe_novel_exists and coverage >= 2.0:
             base -= 5.0
+        if self.phase != "opening" and self.stagnation_count >= 4 and coverage >= 2.0:
+            base -= 2.5 + 0.6 * float(self.stagnation_count - 3)
+        if escape_pressure > 0.0 and frontier_step == 0.0 and novelty < 0.5 and escape_egg_delta <= 0.0:
+            base -= 1.8 * escape_pressure
         # Avoid immediate backtracks to the previous position
         if next_loc == self.prev_pos:
             base -= 16.0
         # Cycle avoidance: penalize re-entering short cycles (A-B-A, A-B-C-A) more when stagnating
         cycle_pen = self._cycle_penalty(next_loc)
         base -= min(12.0, cycle_pen * (1.0 + 0.5 * stuck_pressure))
+        # Strong oscillation penalty: detect A↔B bouncing and break it
+        osc_pen = self._oscillation_penalty(cur, next_loc)
+        base -= osc_pen
         # Opening anti-regression: avoid moving back toward spawn or against lane
         if self.phase == "opening":
             reg_out = max(0, cur_out - nxt_out)
@@ -620,14 +726,22 @@ class PlayerAgent:
             self.visited_tiles.add(loc)
 
     def _maybe_refresh_frontier(self, board: Board) -> None:
-        # Refresh if no target, already reached, or stale
+        # Refresh if no target, already reached, stale, or we're stuck mid/endgame
+        stuck_refresh = (
+            self.phase != "opening"
+            and (
+                self.stagnation_count >= 3
+                or self.moves_since_last_egg >= 4
+            )
+        )
         if (
             self.frontier_target is None
             or self.frontier_target in self.visited_tiles
             or board.turn_count >= self.frontier_refresh_turn
+            or stuck_refresh
         ):
             self.frontier_target = self._compute_frontier_target(board)
-            self.frontier_refresh_turn = board.turn_count + 6
+            self.frontier_refresh_turn = board.turn_count + (4 if stuck_refresh else 6)
 
     def _compute_frontier_target(self, board: Board) -> Optional[Tuple[int, int]]:
         start = board.chicken_player.get_location()
@@ -638,6 +752,12 @@ class PlayerAgent:
         max_depth = 18
         center = (self.size - 1) / 2.0
         sx, sy = self.spawn
+        stuck_mode = self.phase != "opening" and (
+            self.stagnation_count >= 3 or self.moves_since_last_egg >= 4
+        )
+        # In mid/endgame, prioritize areas where we can lay eggs
+        egg_seeking = self.phase != "opening" and self.moves_since_last_egg >= 2
+        dist_penalty = 0.18 if stuck_mode else 0.3
         while q:
             loc, dist = q.popleft()
             if dist > max_depth:
@@ -651,10 +771,18 @@ class PlayerAgent:
             risk = self._risk_at(loc)
             center_dist = abs(x - center) + abs(y - center)
             outward = abs(x - sx) + abs(y - sy)
-            score = 6.0 * novelty - 0.3 * dist - 0.6 * risk
+            score = 6.0 * novelty - dist_penalty * dist - 0.6 * risk
             # Opening bias: nudge toward centerline and outward expansion
             if self.phase == "opening":
                 score += -0.12 * center_dist + 0.05 * outward
+            elif stuck_mode:
+                score += 0.35 * outward - 0.08 * center_dist + 0.2 * dist
+            # Mid/endgame: strongly prefer tiles where we can lay eggs
+            if egg_seeking and board.can_lay_egg_at_loc(loc):
+                score += 4.0
+                # Extra bonus for egg tiles far from current position (explore new areas)
+                if dist >= 4:
+                    score += 2.0
             if score > best_score:
                 best_score = score
                 best_target = loc
@@ -846,6 +974,26 @@ class PlayerAgent:
                 return True
         return False
 
+    def _nearest_egg_distance(self, board: Board, start: Tuple[int, int], limit: int = 5) -> int:
+        """Return BFS distance to the nearest eggable tile up to a limit (else limit+1)."""
+        visited = set([start])
+        q: deque[Tuple[Tuple[int, int], int]] = deque([(start, 0)])
+        while q:
+            loc, dist = q.popleft()
+            if dist > limit:
+                break
+            if board.can_lay_egg_at_loc(loc):
+                return dist
+            for dir_ in Direction:
+                nxt = loc_after_direction(loc, dir_)
+                if nxt in visited or not self._in_bounds(nxt):
+                    continue
+                if board.is_cell_blocked(nxt):
+                    continue
+                visited.add(nxt)
+                q.append((nxt, dist + 1))
+        return limit + 1
+
     def _path_progress(self, board: Board, loc: Tuple[int, int]) -> float:
         best = 0.0
         for idx, target in enumerate(self.loop_targets[:14]):
@@ -1029,6 +1177,33 @@ class PlayerAgent:
             if repeats >= 2:
                 pen += 2.0
         return pen
+
+    def _oscillation_penalty(self, cur: Tuple[int, int], next_loc: Tuple[int, int]) -> float:
+        """Detect and heavily penalize A↔B oscillation patterns."""
+        n = len(self.recent_positions)
+        if n < 4:
+            return 0.0
+        recent = list(self.recent_positions)[-8:]
+        
+        # Check for A-B-A-B pattern (oscillating between two tiles)
+        unique_recent = set(recent)
+        # Only trigger if we've been stuck for at least 4 moves
+        if len(unique_recent) <= 2 and len(recent) >= 4:
+            # We've been bouncing between at most 2 tiles
+            if next_loc in unique_recent:
+                # Staying in oscillation - penalty scales with duration
+                duration = len(recent) - 3  # How many turns beyond minimum
+                return 30.0 + 8.0 * duration
+            else:
+                # Breaking out! Give a BONUS (negative penalty)
+                return -15.0
+        
+        # Check for A-B-A pattern in last 4 positions
+        if n >= 4:
+            if recent[-1] == recent[-3] and recent[-2] == recent[-4] and next_loc == recent[-2]:
+                return 20.0
+        
+        return 0.0
     
     def _distance_to_border(self, loc: Tuple[int, int]) -> int:
         x, y = loc

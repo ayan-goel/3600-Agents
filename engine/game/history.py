@@ -18,8 +18,11 @@ class History:
         self.b_moves_left=[]
         self.trapdoor_triggered=[]
 
-    def record_trapdoor(self, trigger_trap):
+    def record_trapdoor(self, trigger_trap, loc = None):
         self.trapdoor_triggered.append(int(trigger_trap))
+        if not loc is None:
+            self.pos[-1] = loc
+
 
 
     def record_round_update(

@@ -50,3 +50,4 @@ def make_state_tensors(board: Board, belief: TrapdoorBelief) -> Tuple[torch.Tens
     return board_tensor, scalar_tensor
 
 
+

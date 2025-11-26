@@ -1,8 +1,8 @@
 import os
 from multiprocessing import Process, Queue
 
-from engine.game.board import Board
-from engine.game.trapdoor_manager import TrapdoorManager
+from game.board import Board
+from game.trapdoor_manager import TrapdoorManager
 
 
 def get_file_permissions(file_path):

@@ -34,7 +34,7 @@ def loc_after_direction(loc: Tuple[int, int], dir: Direction) -> Tuple[int, int]
     elif dir == Direction.RIGHT:
         return (x + 1, y)
     else:
-        raise ValueError("Invalid direction")
+        raise ValueError(f"Invalid direction:{dir}")
         return (0, 0)
 
 

@@ -1,7 +1,7 @@
 import numpy as np
-from engine.game.board import Board
-from engine.game.enums import Cell, MoveType, WinReason
-from engine.game.history import History
+from game.board import Board
+from game.enums import Cell, MoveType, WinReason
+from game.history import History
 
 
 def get_board_string(board: Board, trapdoors=set()):

@@ -1,7 +1,7 @@
 from typing import Tuple
 
-from .enums import Direction
-from .game_map import prob_feel, prob_hear
+from game.enums import Direction
+from game.game_map import prob_feel, prob_hear
 
 
 class Chicken:

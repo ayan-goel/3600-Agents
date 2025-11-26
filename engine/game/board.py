@@ -1,15 +1,15 @@
 from typing import List, Tuple
 
-from .chicken import Chicken
-from .enums import (
+from game.chicken import Chicken
+from game.enums import (
     Direction,
     MoveType,
     Result,
     WinReason,
     loc_after_direction,
 )
-from .game_map import GameMap
-from .history import History
+from game.game_map import GameMap
+from game.history import History
 
 
 def manhattan_distance(p1: Tuple[int, int], p2: Tuple[int, int]) -> int:

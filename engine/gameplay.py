@@ -3,10 +3,10 @@ from collections.abc import Iterable
 from typing import Set, Tuple
 
 from board_utils import get_board_string
-from engine.game.board import Board
-from engine.game.enums import Direction, MoveType, Result, ResultArbiter, WinReason
-from engine.game.game_map import GameMap
-from engine.game.trapdoor_manager import TrapdoorManager
+from game.board import Board
+from game.enums import Direction, MoveType, Result, ResultArbiter, WinReason
+from game.game_map import GameMap
+from game.trapdoor_manager import TrapdoorManager
 from player_process import PlayerProcess
 
 
@@ -274,7 +274,7 @@ def play_game(
 
     try:
         player_a_process.start()
-        success_a = main_q_a.get(block=True, timeout=1)
+        success_a = main_q_a.get(block=True, timeout=10)
         player_a_process.pause_process_and_children()
     except Exception as e:
         message_a = traceback.format_exc()
@@ -282,7 +282,7 @@ def play_game(
 
     try:
         player_b_process.start()
-        success_b = main_q_b.get(block=True, timeout=1)
+        success_b = main_q_b.get(block=True, timeout=10)
         player_b_process.pause_process_and_children()
     except Exception as e:
         message_b = traceback.format_exc()
@@ -306,19 +306,19 @@ def play_game(
         terminate_game(
             player_a_process, player_b_process, queues, out_queue, stop_event
         )
-        return game_board, message_a, message_b
+        return game_board, message_a, message_b, [], []
     elif not success_a:
         game_board.set_winner(ResultArbiter.PLAYER_B, WinReason.FAILED_INIT)
         terminate_game(
             player_a_process, player_b_process, queues, out_queue, stop_event
         )
-        return game_board, message_a, message_b
+        return game_board, message_a, message_b, [], []
     elif not success_b:
         game_board.set_winner(ResultArbiter.PLAYER_A, WinReason.FAILED_INIT)
         terminate_game(
             player_a_process, player_b_process, queues, out_queue, stop_event
         )
-        return game_board, message_a, message_b
+        return game_board, message_a, message_b, [], []
 
     # start actual gameplay
     #
@@ -393,9 +393,9 @@ def play_game(
                         -1 * game_board.game_map.TRAPDOOR_PENALTY
                     )
                     game_board.found_trapdoors.add(new_location)
-                    game_board.get_history().record_trapdoor(True)
+                    game_board.get_history().record_trapdoor(True, game_board.chicken_player.get_location())
                 else:
-                    game_board.get_history().record_trapdoor(False)
+                    game_board.get_history().record_trapdoor(False, game_board.chicken_player.get_location())
             # hack to deal with apply_move shenanigans
 
 
