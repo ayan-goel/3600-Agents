@@ -161,6 +161,9 @@ def train(
     policy_weight: float = 1.0,
     value_weight: float = 0.5,
     limit: Optional[int] = None,
+    min_egg_diff: int = 0,
+    min_winner_eggs: int = 0,
+    exclude_draws: bool = False,
     use_small_net: bool = False,
     device: Optional[str] = None,
 ):
@@ -173,6 +176,8 @@ def train(
     
     # Create dataloaders
     print(f"Loading data from {csv_path}...")
+    if min_egg_diff > 0 or min_winner_eggs > 0 or exclude_draws:
+        print(f"Filtering: min_egg_diff={min_egg_diff}, min_winner_eggs={min_winner_eggs}, exclude_draws={exclude_draws}")
     train_loader, val_loader = create_dataloaders(
         csv_path,
         batch_size=batch_size,
@@ -180,6 +185,9 @@ def train(
         winner_weight=winner_weight,
         loser_weight=loser_weight,
         limit=limit,
+        min_egg_diff=min_egg_diff,
+        min_winner_eggs=min_winner_eggs,
+        exclude_draws=exclude_draws,
     )
     print(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
     
@@ -277,6 +285,12 @@ def main():
                         help="Weight for value loss")
     parser.add_argument("--limit", type=int, default=None,
                         help="Limit number of matches to load")
+    parser.add_argument("--min_egg_diff", type=int, default=0,
+                        help="Minimum egg differential to include match (filters for dominant wins)")
+    parser.add_argument("--min_winner_eggs", type=int, default=0,
+                        help="Minimum eggs the winner must have")
+    parser.add_argument("--exclude_draws", action="store_true",
+                        help="Exclude draw games")
     parser.add_argument("--small", action="store_true",
                         help="Use smaller network")
     parser.add_argument("--device", type=str, default=None,
@@ -297,6 +311,9 @@ def main():
         policy_weight=args.policy_weight,
         value_weight=args.value_weight,
         limit=args.limit,
+        min_egg_diff=args.min_egg_diff,
+        min_winner_eggs=args.min_winner_eggs,
+        exclude_draws=args.exclude_draws,
         use_small_net=args.small,
         device=args.device,
     )

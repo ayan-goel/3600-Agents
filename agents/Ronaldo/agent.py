@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
@@ -18,11 +18,8 @@ try:
 except ImportError:
     TORCH_AVAILABLE = False
 
-from game.agent_interface import AgentInterface
 from game.board import Board
-from game.chicken import Chicken
 from game.enums import Direction, MoveType
-from game.game_map import GameMap
 
 # Action space mapping
 DIRECTIONS = [Direction.UP, Direction.DOWN, Direction.LEFT, Direction.RIGHT]
@@ -47,13 +44,14 @@ DIR_DELTA = {
 }
 
 
-class RonaldoAgent(AgentInterface):
+class PlayerAgent:
     """Neural network agent with heuristic safety checks."""
     
-    def __init__(self):
+    def __init__(self, board: Board, time_left: Callable[[], float]):
+        del time_left  # Not used
         self.model = None
         self.device = None
-        self.size = 8
+        self.size = board.game_map.MAP_SIZE
         self.known_traps: Set[Tuple[int, int]] = set()
         self.turn_count = 0
         
@@ -66,9 +64,10 @@ class RonaldoAgent(AgentInterface):
             print("PyTorch not available, using fallback heuristics")
             return
         
-        # Try to find weights file
+        # Try to find weights file (prefer self-play weights)
         agent_dir = Path(__file__).parent
         weights_paths = [
+            agent_dir / "ronaldo_selfplay_best.pt",
             agent_dir / "ronaldo_weights.pt",
             agent_dir / "ronaldo_weights_winner.pt",
         ]
@@ -103,14 +102,24 @@ class RonaldoAgent(AgentInterface):
             self.model.eval()
             
             print(f"Loaded Ronaldo model from {weights_path}")
-            print(f"  Val accuracy: {checkpoint.get('val_acc', 'N/A'):.4f}")
+            val_acc = checkpoint.get('val_acc', checkpoint.get('avg_eggs', 'N/A'))
+            if isinstance(val_acc, (int, float)):
+                print(f"  Val accuracy/avg_eggs: {val_acc:.4f}")
+            else:
+                print(f"  Val accuracy: {val_acc}")
             
         except Exception as e:
             print(f"Error loading model: {e}")
             self.model = None
     
-    def play(self, board: Board) -> Tuple[Direction, MoveType]:
+    def play(
+        self,
+        board: Board,
+        sensor_data: List[Tuple[bool, bool]],
+        time_left: Callable[[], float],
+    ) -> Tuple[Direction, MoveType]:
         """Select a move using neural network + safety checks."""
+        del sensor_data, time_left  # Not used
         self.turn_count += 1
         self.size = board.game_map.MAP_SIZE
         
@@ -142,9 +151,9 @@ class RonaldoAgent(AgentInterface):
     
     def _update_traps(self, board: Board):
         """Track revealed trapdoors."""
-        for trap in board.game_map.trapdoors:
-            if trap.is_revealed:
-                self.known_traps.add((trap.x, trap.y))
+        # Use found_trapdoors attribute if available
+        for loc in getattr(board, "found_trapdoors", set()):
+            self.known_traps.add(loc)
     
     def _get_legal_moves(self, board: Board) -> List[Tuple[Direction, MoveType]]:
         """Get all legal moves from current position."""
@@ -383,5 +392,5 @@ class RonaldoAgent(AgentInterface):
 
 
 # Alias for compatibility
-Agent = RonaldoAgent
+Agent = PlayerAgent
 

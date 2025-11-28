@@ -287,6 +287,9 @@ def load_csv_dataset(
     board_size: int = 8,
     limit: Optional[int] = None,
     min_turns: int = 20,
+    min_egg_diff: int = 0,
+    min_winner_eggs: int = 0,
+    exclude_draws: bool = False,
 ) -> List[TrainingSample]:
     """
     Load training samples from CSV file.
@@ -296,6 +299,9 @@ def load_csv_dataset(
         board_size: Board size (default 8)
         limit: Max number of matches to load (None = all)
         min_turns: Minimum turns for a valid match
+        min_egg_diff: Minimum egg differential to include match (filters for dominant wins)
+        min_winner_eggs: Minimum eggs the winner must have
+        exclude_draws: Whether to exclude draws
     
     Returns:
         List of TrainingSample objects
@@ -320,10 +326,27 @@ def load_csv_dataset(
                     matches_skipped += 1
                     continue
                 
-                # Skip draws if we want cleaner signal
-                # result = match_log.get("result", 0)
-                # if result == 0:
-                #     continue
+                # Skip draws if requested
+                result = match_log.get("result", 2)  # 0=A wins, 1=B wins, 2=draw
+                if exclude_draws and result == 2:
+                    matches_skipped += 1
+                    continue
+                
+                # Filter by egg differential
+                a_eggs_list = match_log.get("a_eggs_laid", [0])
+                b_eggs_list = match_log.get("b_eggs_laid", [0])
+                a_eggs = a_eggs_list[-1] if a_eggs_list else 0
+                b_eggs = b_eggs_list[-1] if b_eggs_list else 0
+                egg_diff = abs(a_eggs - b_eggs)
+                winner_eggs = max(a_eggs, b_eggs)
+                
+                if egg_diff < min_egg_diff:
+                    matches_skipped += 1
+                    continue
+                
+                if winner_eggs < min_winner_eggs:
+                    matches_skipped += 1
+                    continue
                 
                 samples = parse_match(match_log, board_size)
                 all_samples.extend(samples)
@@ -347,13 +370,22 @@ def create_dataloaders(
     winner_weight: float = 1.0,
     loser_weight: float = 0.3,
     limit: Optional[int] = None,
+    min_egg_diff: int = 0,
+    min_winner_eggs: int = 0,
+    exclude_draws: bool = False,
     num_workers: int = 0,
 ) -> Tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
     """Create train and validation dataloaders."""
     from torch.utils.data import DataLoader, random_split
     
     # Load all samples
-    samples = load_csv_dataset(csv_path, limit=limit)
+    samples = load_csv_dataset(
+        csv_path, 
+        limit=limit,
+        min_egg_diff=min_egg_diff,
+        min_winner_eggs=min_winner_eggs,
+        exclude_draws=exclude_draws,
+    )
     
     # Create dataset
     dataset = ChickenDataset(
