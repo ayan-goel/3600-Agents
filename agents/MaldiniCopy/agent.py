@@ -914,6 +914,233 @@ class PlayerAgent:
                         if best_plain is not None:
                             choice = best_plain
         
+        # =================================================================
+        # MALDINI: PURE ENDGAME EGG HUNTING MODE
+        # =================================================================
+        # In the endgame, FORGET about the opponent, territory, oscillation, etc.
+        # Just find and lay eggs as fast as possible!
+        # This overrides ALL other logic when in endgame
+        turns_left = board.turns_left_player
+        if turns_left <= 20:  # Endgame threshold
+            # Step 1: If we can lay an egg RIGHT NOW, do it
+            egg_moves = [mv for mv in legal_moves if mv[1] == MoveType.EGG]
+            if egg_moves:
+                # Pick the best egg move (lowest risk, best position)
+                best_egg = None
+                best_egg_score = -1e9
+                for mv in egg_moves:
+                    egg_loc = loc_after_direction(cur_loc, mv[0])
+                    if not board.is_valid_cell(egg_loc) or board.is_cell_blocked(egg_loc):
+                        continue
+                    
+                    score = 200.0  # Base score - eggs are EVERYTHING
+                    
+                    # Bonus for corners (3 points!)
+                    if self._is_corner(cur_loc):
+                        score += 100.0
+                    
+                    # Bonus for setting up more eggs
+                    if self._is_my_parity(egg_loc):
+                        score += 30.0  # Next tile is also eggable
+                    
+                    # Bonus for unvisited territory (more eggs likely)
+                    if egg_loc not in self.visited_tiles:
+                        score += 40.0
+                    
+                    # Risk penalty (but reduced - we need eggs!)
+                    score -= 30.0 * self._risk_at(egg_loc)
+                    
+                    if score > best_egg_score:
+                        best_egg_score = score
+                        best_egg = mv
+                
+                if best_egg is not None:
+                    choice = best_egg
+            else:
+                # Step 2: Can't egg now - find the FASTEST path to an egg opportunity
+                # Use BFS to find nearest eggable tile
+                best_egg_hunt = None
+                best_hunt_score = -1e9
+                
+                for mv in legal_moves:
+                    if mv[1] == MoveType.TURD:
+                        continue  # Never turd in endgame
+                    
+                    next_loc = loc_after_direction(cur_loc, mv[0])
+                    if not board.is_valid_cell(next_loc) or board.is_cell_blocked(next_loc):
+                        continue
+                    
+                    score = 0.0
+                    
+                    # How far to nearest egg opportunity from this tile?
+                    dist_to_egg = self._nearest_egg_distance(board, next_loc, limit=8)
+                    cur_dist_to_egg = self._nearest_egg_distance(board, cur_loc, limit=8)
+                    
+                    # HUGE bonus for getting closer to egg opportunities
+                    egg_progress = cur_dist_to_egg - dist_to_egg
+                    score += 50.0 * egg_progress
+                    
+                    # Can we egg immediately from next_loc?
+                    if board.can_lay_egg_at_loc(next_loc):
+                        score += 100.0
+                    
+                    # Bonus for corners (rush to get them!)
+                    corners = [(0, 0), (0, self.size - 1), (self.size - 1, 0), (self.size - 1, self.size - 1)]
+                    for corner in corners:
+                        if corner in board.eggs_player or corner in board.eggs_enemy:
+                            continue
+                        if board.is_cell_blocked(corner):
+                            continue
+                        corner_dist_cur = self._manhattan(cur_loc, corner)
+                        corner_dist_next = self._manhattan(next_loc, corner)
+                        if corner_dist_next < corner_dist_cur:
+                            score += 40.0  # Moving toward unclaimed corner
+                            if corner_dist_next <= 2:
+                                score += 30.0  # Very close to corner!
+                    
+                    # Bonus for unvisited tiles (more egg opportunities)
+                    if next_loc not in self.visited_tiles:
+                        score += 35.0
+                    
+                    # Bonus for parity tiles (can egg there)
+                    if self._is_my_parity(next_loc):
+                        score += 20.0
+                    
+                    # Penalty for risk
+                    score -= 25.0 * self._risk_at(next_loc)
+                    
+                    # Penalty for backtracking
+                    if next_loc == self.prev_pos:
+                        score -= 40.0
+                    
+                    if score > best_hunt_score:
+                        best_hunt_score = score
+                        best_egg_hunt = mv
+                
+                if best_egg_hunt is not None:
+                    choice = best_egg_hunt
+        
+        # MALDINI: STRATEGIC TURD DROPS - CUT OFF OPPONENT EXPANSION
+        # Key insight: Turds are FREE when we can't lay an egg anyway!
+        # 
+        # Strategy:
+        # - NO turds in early game (moves 0-9) - focus on expansion
+        # - MIDGAME (moves 10-28): Use turds to CUT OFF opponent's expansion path
+        # - Place turds between enemy and unexplored territory
+        # - Never turd in endgame (need to focus on eggs)
+        turds_remaining = 5 - len(board.turds_player)
+        our_move_count = board.turn_count // 2
+        
+        # Check if turd moves are available (requires distance >= 2 from enemy)
+        turd_moves = [mv for mv in legal_moves if mv[1] == MoveType.TURD]
+        
+        # Can we lay an egg at our current position?
+        can_egg_here = board.can_lay_egg()
+        
+        # Turd window: MIDGAME ONLY (moves 10-28)
+        # This is when we're actively contesting territory with opponent
+        in_turd_window = 10 <= our_move_count <= 28 and board.turns_left_player > 12
+        
+        center_col = self.size // 2
+        enemy_loc = board.chicken_enemy.get_location()
+        
+        if turd_moves and turds_remaining > 0 and in_turd_window:
+            # KEY: If we CAN'T egg here, turd is FREE - always consider it!
+            should_consider_turd = (not can_egg_here) or (choice[1] != MoveType.EGG)
+            
+            if should_consider_turd:
+                best_turd = None
+                best_turd_score = -1e9
+                
+                spawn_on_left = self.spawn[0] < center_col
+                
+                # Calculate enemy's likely expansion direction
+                # Enemy wants to go away from their spawn toward center/our side
+                enemy_expansion_dir_x = 1 if self.enemy_spawn[0] == 0 else -1
+                
+                for mv in turd_moves:
+                    turd_loc = loc_after_direction(cur_loc, mv[0])
+                    if not board.is_valid_cell(turd_loc) or board.is_cell_blocked(turd_loc):
+                        continue
+                    
+                    # Base score - higher if we can't egg (turd is free!)
+                    score = 120.0 if not can_egg_here else 40.0
+                    
+                    dist_from_center = abs(cur_loc[0] - center_col)
+                    dist_to_enemy = self._manhattan(cur_loc, enemy_loc)
+                    
+                    # ===== CUTOFF VALUE - This is the key metric =====
+                    # A turd is valuable if it's BETWEEN the enemy and open space
+                    
+                    # Is this turd blocking enemy's path toward our side?
+                    on_enemy_half = (cur_loc[0] >= center_col) if spawn_on_left else (cur_loc[0] < center_col)
+                    
+                    # HUGE bonus for turds that cut off enemy expansion
+                    # Best position: near center, between enemy and unexplored territory
+                    if dist_from_center <= 2 and dist_to_enemy <= 5:
+                        score += 100.0  # Prime cutoff position!
+                    elif dist_from_center <= 3 and dist_to_enemy <= 6:
+                        score += 70.0  # Good cutoff position
+                    
+                    # Bonus for being on enemy's expansion path
+                    # If we're ahead of the enemy (closer to their destination)
+                    if on_enemy_half:
+                        score += 60.0  # We're in their territory
+                        
+                        # Extra bonus if we're blocking their path to center
+                        if dist_to_enemy <= 4:
+                            score += 40.0  # Directly blocking them!
+                    
+                    # Bonus for same row as enemy (horizontal cutoff)
+                    if abs(cur_loc[1] - enemy_loc[1]) <= 1:
+                        score += 35.0  # Same row - blocks horizontal movement
+                    
+                    # Bonus for being between enemy and unclaimed corners
+                    corners = [(0, 0), (0, self.size - 1), (self.size - 1, 0), (self.size - 1, self.size - 1)]
+                    for corner in corners:
+                        if corner in board.eggs_player or corner in board.eggs_enemy:
+                            continue
+                        enemy_to_corner = self._manhattan(enemy_loc, corner)
+                        turd_to_corner = self._manhattan(cur_loc, corner)
+                        # If we're between enemy and corner
+                        if turd_to_corner < enemy_to_corner and enemy_to_corner <= 5:
+                            score += 30.0  # Blocking their corner access
+                    
+                    # Moderate bonus for protecting our egg clusters
+                    eggs_nearby = sum(1 for e in board.eggs_player if self._manhattan(cur_loc, e) <= 2)
+                    if eggs_nearby >= 2:
+                        score += 20.0
+                    
+                    # Bonus for new territory
+                    if turd_loc not in self.visited_tiles:
+                        score += 15.0
+                    
+                    # PENALTY: Don't waste turds far from the action
+                    if dist_to_enemy > 8:
+                        score -= 50.0  # Too far from enemy to matter
+                    
+                    # PENALTY: Don't waste turds in our own corner
+                    dist_to_our_spawn = self._manhattan(cur_loc, self.spawn)
+                    if dist_to_our_spawn <= 3 and dist_from_center > 3:
+                        score -= 60.0  # Wasted in our corner
+                    
+                    # Risk penalty
+                    score -= 15.0 * self._risk_at(turd_loc)
+                    
+                    if score > best_turd_score:
+                        best_turd_score = score
+                        best_turd = mv
+                
+                # Turd decision
+                if best_turd is not None:
+                    if not can_egg_here:
+                        # Turd is FREE - do it if it has cutoff value
+                        if best_turd_score > 80.0:
+                            choice = best_turd
+                    elif best_turd_score > 180.0 and choice[1] != MoveType.EGG:
+                        # Only override for really high-value cutoff positions
+                        choice = best_turd
+        
         if choice[1] == MoveType.EGG:
             self.moves_since_last_egg = 0
         else:
@@ -1100,6 +1327,16 @@ class PlayerAgent:
 
         if mt == MoveType.EGG:
             base = 60.0
+            
+            # MALDINI: ENDGAME EGG PRIORITY - in endgame, eggs are EVERYTHING
+            if self.phase == "endgame":
+                base = 100.0  # Much higher base score for eggs in endgame
+                # Extra bonus based on turns remaining - more urgent as game ends
+                if board.turns_left_player <= 10:
+                    base += 40.0  # Critical endgame - MUST lay eggs
+                elif board.turns_left_player <= 20:
+                    base += 20.0  # Late endgame
+            
             if self.moves_since_last_egg >= 2:
                 base += 15.0
             elif self.moves_since_last_egg >= 1:
@@ -1148,14 +1385,18 @@ class PlayerAgent:
             return base
 
         if mt == MoveType.TURD:
-            block = self._turd_block_value(board, cur)
-            base = 12.0 * block
-            if egg_diff >= 2:
-                base -= 12.0
-            else:
-                base += 4.0
-            base -= 18.0 * risk_here
-            base -= 8.0 * risk_next
+            # MALDINI: SIMPLIFIED TURD SCORING
+            # The forced turd logic in play() handles strategic placement
+            # This scoring is just a fallback for when turds compete normally
+            base = 20.0
+            
+            # Basic bonus if we can't egg here (turd is "free")
+            if not board.can_lay_egg():
+                base += 30.0
+            
+            # Risk penalty
+            base -= 15.0 * self._risk_at(cur)
+            
             return base
 
         lane_progress = self._lane_progress(cur, next_loc)
@@ -1181,24 +1422,47 @@ class PlayerAgent:
         # MALDINI: Opponent pressure - reward moves that limit enemy options
         opponent_pressure = self._opponent_pressure_score(board, next_loc)
         
-        # MALDINI: Global cutoff drive - if we are far from enemy, reward moving closer
+        # MALDINI: Global cutoff drive - TRACK AND INTERCEPT the opponent
+        # In midgame, we MUST be aware of opponent and contest territory
         cutoff_drive = 0.0
-        if self.phase != "opening":
+        if self.phase == "midgame":  # Only in midgame, not opening or endgame
             enemy_loc = board.chicken_enemy.get_location()
             dist_to_enemy = self._manhattan(next_loc, enemy_loc)
             curr_dist_to_enemy = self._manhattan(cur, enemy_loc)
             
-            # Only apply drive if we are relatively safe and enemy is far
-            if dist_to_enemy > 3 and risk_next < 0.6:
+            # Always reward closing distance in midgame (unless very risky)
+            if risk_next < 0.7:
                 if dist_to_enemy < curr_dist_to_enemy:
-                    cutoff_drive = 2.0  # Reward moving closer
+                    # Stronger bonus when enemy is far (we need to catch up)
+                    if curr_dist_to_enemy > 5:
+                        cutoff_drive = 8.0  # Strong chase when far
+                    elif curr_dist_to_enemy > 3:
+                        cutoff_drive = 5.0  # Medium chase
+                    else:
+                        cutoff_drive = 3.0  # Maintain pressure when close
             
-            # Additional bonus for moving towards center if enemy dominates center
-            enemy_center_dist = self._distance_to_center(enemy_loc)
+            # Bonus for moving towards center - center control is key
             nxt_center_d = self._distance_to_center(next_loc)
             cur_center_d = self._distance_to_center(cur)
-            if enemy_center_dist < 3.0 and nxt_center_d < cur_center_d:
-                cutoff_drive += 1.5
+            if nxt_center_d < cur_center_d:
+                cutoff_drive += 3.0  # Center control bonus
+            
+            # Extra bonus if enemy is dominating center and we're reclaiming
+            enemy_center_dist = self._distance_to_center(enemy_loc)
+            if enemy_center_dist < 2.5 and nxt_center_d < cur_center_d:
+                cutoff_drive += 4.0  # Contest their center control
+            
+            # Bonus for moves that put us between enemy and unclaimed corners
+            corners = [(0, 0), (0, self.size - 1), (self.size - 1, 0), (self.size - 1, self.size - 1)]
+            for corner in corners:
+                if corner in board.eggs_player or corner in board.eggs_enemy:
+                    continue
+                enemy_to_corner = self._manhattan(enemy_loc, corner)
+                our_to_corner = self._manhattan(next_loc, corner)
+                cur_to_corner = self._manhattan(cur, corner)
+                # If we're getting between enemy and an unclaimed corner
+                if our_to_corner < enemy_to_corner and our_to_corner < cur_to_corner:
+                    cutoff_drive += 4.0  # Intercepting corner access
 
         # Enemy turd proximity (radius-2)
         enemy_turds_near = self._count_enemy_turds_within(board, next_loc, radius=2)
@@ -1213,18 +1477,21 @@ class PlayerAgent:
             nearest_egg_steps = self._nearest_egg_distance(board, next_loc, limit=6)
             nearest_egg_cur = self._nearest_egg_distance(board, cur, limit=6)
         # Egg opportunity seeking: in mid/endgame, reward moving closer to egg tiles
+        # MALDINI: Much stronger in endgame - we NEED to find and lay eggs
         egg_seek_bonus = 0.0
         if self.phase != "opening" and self.moves_since_last_egg >= 2:
             # Reward getting closer to eggable tiles
             egg_improvement = nearest_egg_cur - nearest_egg_steps
             if egg_improvement > 0:
-                egg_seek_bonus = 3.0 * egg_improvement
+                # Much stronger bonus in endgame
+                multiplier = 8.0 if self.phase == "endgame" else 3.0
+                egg_seek_bonus = multiplier * egg_improvement
             # Extra bonus if we're far from any egg opportunity and moving toward one
             if nearest_egg_cur >= 4 and egg_improvement > 0:
-                egg_seek_bonus += 4.0
+                egg_seek_bonus += 10.0 if self.phase == "endgame" else 4.0
             # Bonus for moving to an immediately eggable tile
             if next_is_eggable and nearest_egg_cur >= 2:
-                egg_seek_bonus += 5.0
+                egg_seek_bonus += 15.0 if self.phase == "endgame" else 5.0
         # Edge escape: encourage moving away from borders when cramped
         cur_edge = self._distance_to_border(cur)
         nxt_edge = self._distance_to_border(next_loc)
@@ -1271,6 +1538,149 @@ class PlayerAgent:
         territory_contrib = self._clamp(territory_contrib, -6.0, 6.0)
         # Harmonize: if BFS territory is already strong, damp local Voronoi bonus to avoid double counting
         vor_bonus = 0.0 if abs(t_adv) >= 4.0 else 0.5 * vor_bonus_raw
+        
+        # MALDINI: MIDGAME AGGRESSION - DOMINATE THE BOARD
+        # This is where we WIN or LOSE the game. Be AGGRESSIVE.
+        midgame_aggression = 0.0
+        if self.phase == "midgame":
+            center_col = self.size // 2
+            spawn_on_left = self.spawn[0] < center_col
+            enemy_loc = board.chicken_enemy.get_location()
+            enemy_spawn = board.chicken_enemy.get_spawn()
+            dist_to_enemy = self._manhattan(next_loc, enemy_loc)
+            cur_dist_to_enemy = self._manhattan(cur, enemy_loc)
+            
+            # Which half of the board
+            on_enemy_half = (next_loc[0] >= center_col) if spawn_on_left else (next_loc[0] < center_col)
+            on_our_half = not on_enemy_half
+            
+            # Predict enemy movement direction
+            enemy_heading = self._predict_enemy_direction()
+            
+            # === TRACK THE OPPONENT ===
+            # In midgame, we MUST know where the opponent is and respond
+            # If they're expanding into open space, we need to cut them off
+            
+            # Strong reward for closing distance when opponent is far
+            if cur_dist_to_enemy > 4:
+                # Opponent is far - we need to get closer to contest
+                if dist_to_enemy < cur_dist_to_enemy:
+                    midgame_aggression += 20.0  # Strong chase bonus
+            elif cur_dist_to_enemy > 2:
+                # Medium distance - pressure them
+                if dist_to_enemy < cur_dist_to_enemy:
+                    midgame_aggression += 15.0
+                    if dist_to_enemy <= 3:
+                        midgame_aggression += 10.0  # Getting close
+            else:
+                # Very close - maintain pressure but don't collide
+                if dist_to_enemy >= 2:
+                    midgame_aggression += 8.0  # Safe distance to keep pressure
+            
+            # === INTERCEPT OPPONENT'S PATH ===
+            # If we know where opponent is heading, get in front of them
+            if enemy_heading is not None:
+                # Calculate where enemy is likely going
+                enemy_target = loc_after_direction(enemy_loc, enemy_heading)
+                if self._in_bounds(enemy_target):
+                    # Reward moves that get us closer to their destination
+                    our_dist_to_target = self._manhattan(next_loc, enemy_target)
+                    enemy_dist_to_target = self._manhattan(enemy_loc, enemy_target)
+                    if our_dist_to_target < enemy_dist_to_target:
+                        midgame_aggression += 25.0  # We can intercept!
+                    elif our_dist_to_target == enemy_dist_to_target:
+                        midgame_aggression += 15.0  # Race condition
+            
+            # === TERRITORY INVASION ===
+            # HUGE reward for being on enemy's half
+            if on_enemy_half:
+                midgame_aggression += 25.0  # Base invasion bonus
+                
+                # Extra for unvisited tiles on enemy side
+                if next_loc not in self.visited_tiles:
+                    midgame_aggression += 20.0  # Claiming new enemy territory!
+                
+                # Bonus for being deeper into enemy territory
+                if spawn_on_left:
+                    depth = next_loc[0] - center_col
+                else:
+                    depth = center_col - next_loc[0]
+                midgame_aggression += 4.0 * max(0, depth)  # Deeper = better
+            
+            # Reward moving toward enemy spawn (ultimate domination)
+            cur_spawn_dist = self._manhattan(cur, enemy_spawn)
+            next_spawn_dist = self._manhattan(next_loc, enemy_spawn)
+            if next_spawn_dist < cur_spawn_dist:
+                midgame_aggression += 15.0
+            
+            # === SPACE DOMINATION ===
+            # Count unexplored tiles on enemy side reachable from this position
+            enemy_side_unexplored = 0
+            our_side_unexplored = 0
+            for dx in range(-4, 5):
+                for dy in range(-4, 5):
+                    if abs(dx) + abs(dy) > 4:
+                        continue
+                    tile = (next_loc[0] + dx, next_loc[1] + dy)
+                    if not self._in_bounds(tile):
+                        continue
+                    if tile in self.visited_tiles or board.is_cell_blocked(tile):
+                        continue
+                    tile_on_enemy_side = (tile[0] >= center_col) if spawn_on_left else (tile[0] < center_col)
+                    if tile_on_enemy_side:
+                        enemy_side_unexplored += 1
+                    else:
+                        our_side_unexplored += 1
+            
+            # Strong preference for moves that access enemy territory
+            midgame_aggression += 3.0 * enemy_side_unexplored
+            # But also don't abandon our side completely
+            midgame_aggression += 1.0 * our_side_unexplored
+            
+            # === CUTTING OFF OPPONENT ===
+            # Reward positioning that blocks enemy from unexplored territory
+            if dist_to_enemy <= 6:
+                blocking_value = 0
+                high_value_blocks = 0
+                for dx in range(-3, 4):
+                    for dy in range(-3, 4):
+                        if abs(dx) + abs(dy) > 3:
+                            continue
+                        tile = (next_loc[0] + dx, next_loc[1] + dy)
+                        if not self._in_bounds(tile):
+                            continue
+                        if tile in self.visited_tiles or board.is_cell_blocked(tile):
+                            continue
+                        our_dist = self._manhattan(next_loc, tile)
+                        enemy_dist_to_tile = self._manhattan(enemy_loc, tile)
+                        if our_dist < enemy_dist_to_tile:
+                            blocking_value += 1
+                            # High value if blocking parity tiles or corners
+                            if self._is_my_parity(tile) or self._is_corner(tile):
+                                high_value_blocks += 1
+                midgame_aggression += 3.0 * blocking_value
+                midgame_aggression += 5.0 * high_value_blocks
+            
+            # === RESPOND TO OPPONENT EXPANSION ===
+            # If opponent has more eggs than us in midgame, be MORE aggressive
+            # But if we're way behind, we need to focus on eggs not just chasing
+            egg_diff = board.chicken_player.get_eggs_laid() - board.chicken_enemy.get_eggs_laid()
+            if egg_diff < -3:
+                # We're way behind - need to balance aggression with egg laying
+                midgame_aggression *= 0.8  # Reduce aggression, focus on eggs
+            elif egg_diff < 0:
+                # We're slightly behind - be more aggressive
+                midgame_aggression *= 1.15
+            elif egg_diff > 3:
+                # We're ahead - can be slightly less aggressive
+                midgame_aggression *= 0.85
+            
+            # === TERRITORY GAINS ===
+            if territory_delta > 0:
+                midgame_aggression += 8.0 * territory_delta
+                if on_enemy_half:
+                    midgame_aggression += 5.0 * territory_delta  # Extra for enemy territory
+        
         escape_bonus = 0.0
         escape_pressure = 0.0
         escape_egg_delta = 0.0
@@ -1339,6 +1749,9 @@ class PlayerAgent:
         # Stuck pressure increases frontier drive
         stuck_pressure = min(1.0, float(self.stagnation_count) / 5.0)
         frontier_wt = (7.2 if self.phase == "opening" else 6.2) + 2.0 * stuck_pressure
+        # MALDINI: Extra frontier pressure in midgame to dominate space
+        if self.phase == "midgame":
+            frontier_wt += 3.0
         if mode == "expand":
             frontier_wt += 2.0
         elif mode == "egg":
@@ -1352,6 +1765,8 @@ class PlayerAgent:
         base += escape_bonus
         base += territory_contrib
         base += egg_seek_bonus
+        # MALDINI: Add midgame aggression bonus
+        base += midgame_aggression
         # MALDINI: Direct unvisited tile bonus
         base += unvisited_bonus
         # Collision avoidance: penalize stepping into predicted enemy next tile
@@ -1379,20 +1794,27 @@ class PlayerAgent:
         else:
             base -= 1.8 * future_egg
         
-        # MALDINI: Opponent pressure bonus - stronger in mid-game
-        # We want to track opponent throughout but not at expense of exploration
+        # MALDINI: Opponent pressure bonus - STRONG in mid-game but BALANCED
+        # Mid-game: Track and pressure opponent, but don't forget eggs!
+        # Endgame: forget opponent, just spam eggs in our territory
         if self.phase == "opening":
             base += 1.5 * opponent_pressure  # Light pressure in opening
         elif self.phase == "midgame":
-            base += 6.0 * opponent_pressure  # Very strong pressure in mid-game
+            base += 7.0 * opponent_pressure  # Strong pressure in mid-game
         else:
-            base += 2.0 * opponent_pressure  # Moderate in endgame
+            base += 0.5 * opponent_pressure  # MINIMAL in endgame - focus on eggs, not opponent
         
         # Mode-specific shaping
+        # MALDINI: In endgame, cutoff mode should be much weaker - we want eggs, not cutoffs
         if mode == "cutoff":
-            base += 3.0 * choke + 1.5 * path_pull + 2.0 * opponent_pressure
+            if self.phase == "endgame":
+                base += 0.5 * choke + 0.3 * path_pull  # Minimal cutoff bonus in endgame
+            else:
+                base += 3.0 * choke + 1.5 * path_pull + 2.0 * opponent_pressure
         elif mode == "egg":
             base += 0.8 * future_egg  # soften anti-egg penalty when we want to egg
+            if self.phase == "endgame":
+                base += 5.0  # Extra bonus for being in egg mode during endgame
         # Corridor/dead-end awareness: discourage moving into dead-ends early unless it cuts off space or enables quick egg
         if self.phase == "opening" and branching <= 1:
             if not (territory_delta > 0.0 or egg_in_two):
@@ -1506,11 +1928,11 @@ class PlayerAgent:
         self, board: Board, legal_moves: Sequence[Tuple[Direction, MoveType]]
     ) -> Optional[Tuple[Direction, MoveType]]:
         """
-        MALDINI Perimeter Sweep Strategy:
-        1. Go straight vertical (UP or DOWN) along our starting edge
-        2. Lay eggs every other move while sweeping
-        3. When we hit the board edge OR enemy is threatening, cut inward
-        4. Never retreat - always advance or hold
+        MALDINI Aggressive Opening Strategy:
+        1. FAST vertical expansion - maximize distance covered
+        2. Lay eggs opportunistically but NEVER slow down expansion
+        3. Watch opponent - if they're expanding faster, we need to match
+        4. NEVER step backward toward spawn - only forward or sideways
         """
         if self.phase != "opening":
             return None
@@ -1518,9 +1940,13 @@ class PlayerAgent:
         cur = board.chicken_player.get_location()
         enemy_loc = board.chicken_enemy.get_location()
         
-        # Determine if enemy is being aggressive (coming toward us)
-        enemy_dist = self._manhattan(cur, enemy_loc)
-        enemy_approaching = enemy_dist <= 4
+        # Calculate expansion metrics
+        our_dist_from_spawn = self._manhattan(cur, self.spawn)
+        enemy_dist_from_spawn = self._manhattan(enemy_loc, self.enemy_spawn)
+        
+        # Are we falling behind in expansion?
+        expansion_deficit = enemy_dist_from_spawn - our_dist_from_spawn
+        need_to_catch_up = expansion_deficit >= 2
         
         # Check if we've reached the vertical edge
         at_top = cur[1] == 0
@@ -1528,61 +1954,99 @@ class PlayerAgent:
         at_vertical_edge = (self._sweep_vertical == Direction.UP and at_top) or \
                           (self._sweep_vertical == Direction.DOWN and at_bottom)
         
-        # Phase 1: Vertical sweep along our edge
+        # Define what "backward" means - toward our spawn
+        center_col = self.size // 2
+        backward_horizontal = Direction.LEFT if self.spawn[0] == 0 else Direction.RIGHT
+        backward_vertical = Direction.DOWN if self.spawn[1] == 0 else Direction.UP
+        
+        # Helper to check if a direction is "backward" (toward spawn)
+        def is_retreat(direction: Direction) -> bool:
+            if direction == backward_horizontal and abs(cur[0] - self.spawn[0]) <= 2:
+                return True
+            if direction == backward_vertical and abs(cur[1] - self.spawn[1]) <= 2:
+                return True
+            return False
+        
+        # Phase 1: Vertical sweep - GO FAST
         if self._perimeter_phase == "vertical":
-            # If we hit the edge or enemy is close, switch to cut-in phase
-            if at_vertical_edge or (enemy_approaching and board.turn_count >= 4):
+            # Switch to cut-in if we hit edge OR we've done enough vertical
+            if at_vertical_edge:
                 self._perimeter_phase = "cut_in"
                 self._cut_in_turn = board.turn_count
             else:
-                # Continue vertical sweep
+                # PRIORITY 1: Keep moving vertically - speed is key!
                 desired_dir = self._sweep_vertical
                 candidates = [mv for mv in legal_moves if mv[0] == desired_dir]
                 
                 if candidates:
-                    # Lay egg if we can and it's safe
-                    if board.can_lay_egg():
+                    # If we're behind on expansion, ALWAYS move (don't stop to egg)
+                    if need_to_catch_up:
+                        plain_moves = [mv for mv in candidates if mv[1] == MoveType.PLAIN]
+                        if plain_moves:
+                            return plain_moves[0]
+                    
+                    # Otherwise, egg if we can (but prefer plain to keep moving)
+                    if board.can_lay_egg() and self._risk_at(cur) < 0.7:
                         egg_moves = [mv for mv in candidates if mv[1] == MoveType.EGG]
-                        if egg_moves and self._risk_at(cur) < 0.8:
+                        if egg_moves:
                             return egg_moves[0]
-                    # Otherwise just move
+                    
                     plain_moves = [mv for mv in candidates if mv[1] == MoveType.PLAIN]
                     if plain_moves:
                         return plain_moves[0]
                 
-                # If we can't go vertical, try to cut in early
+                # Can't go vertical - try horizontal toward center (never backward!)
+                horiz_dir = self._sweep_horizontal
+                horiz_candidates = [mv for mv in legal_moves if mv[0] == horiz_dir]
+                if horiz_candidates:
+                    plain_moves = [mv for mv in horiz_candidates if mv[1] == MoveType.PLAIN]
+                    if plain_moves:
+                        # Still in vertical phase, just stepping around obstacle
+                        return plain_moves[0]
+                
+                # If blocked everywhere forward, switch to cut-in
                 self._perimeter_phase = "cut_in"
                 self._cut_in_turn = board.turn_count
         
         # Phase 2: Cut inward toward center/enemy territory
         if self._perimeter_phase == "cut_in":
-            # Primary direction: horizontal toward center
+            # Primary: horizontal toward center
             desired_dir = self._sweep_horizontal
             candidates = [mv for mv in legal_moves if mv[0] == desired_dir]
             
             if candidates:
-                # Lay egg if we can
-                if board.can_lay_egg():
+                # If behind, prioritize movement over eggs
+                if need_to_catch_up:
+                    plain_moves = [mv for mv in candidates if mv[1] == MoveType.PLAIN]
+                    if plain_moves:
+                        return plain_moves[0]
+                
+                if board.can_lay_egg() and self._risk_at(cur) < 0.7:
                     egg_moves = [mv for mv in candidates if mv[1] == MoveType.EGG]
-                    if egg_moves and self._risk_at(cur) < 0.8:
+                    if egg_moves:
                         return egg_moves[0]
+                
                 plain_moves = [mv for mv in candidates if mv[1] == MoveType.PLAIN]
                 if plain_moves:
                     return plain_moves[0]
             
-            # If horizontal blocked, continue vertical or try alternate
-            # But NEVER go backward (toward our spawn edge)
-            backward_dir = Direction.LEFT if self._sweep_horizontal == Direction.RIGHT else Direction.RIGHT
-            
+            # Secondary: continue vertical or opposite vertical (but NEVER retreat!)
             for alt_dir in [self._sweep_vertical, self._opposite_dir(self._sweep_vertical)]:
-                if alt_dir == backward_dir:
-                    continue  # Never retreat
+                if is_retreat(alt_dir):
+                    continue  # NEVER retreat toward spawn
+                
                 alt_candidates = [mv for mv in legal_moves if mv[0] == alt_dir]
                 if alt_candidates:
-                    if board.can_lay_egg():
+                    if need_to_catch_up:
+                        plain_moves = [mv for mv in alt_candidates if mv[1] == MoveType.PLAIN]
+                        if plain_moves:
+                            return plain_moves[0]
+                    
+                    if board.can_lay_egg() and self._risk_at(cur) < 0.7:
                         egg_moves = [mv for mv in alt_candidates if mv[1] == MoveType.EGG]
-                        if egg_moves and self._risk_at(cur) < 0.8:
+                        if egg_moves:
                             return egg_moves[0]
+                    
                     plain_moves = [mv for mv in alt_candidates if mv[1] == MoveType.PLAIN]
                     if plain_moves:
                         return plain_moves[0]
@@ -1591,7 +2055,35 @@ class PlayerAgent:
             if board.turn_count >= self._cut_in_turn + 6:
                 self._perimeter_phase = "done"
         
-        return None
+        # FALLBACK: If we get here, pick the best non-retreating move
+        best_fallback = None
+        best_fallback_score = -1e9
+        
+        for mv in legal_moves:
+            if is_retreat(mv[0]):
+                continue
+            
+            next_loc = loc_after_direction(cur, mv[0])
+            if not board.is_valid_cell(next_loc) or board.is_cell_blocked(next_loc):
+                continue
+            
+            score = 0.0
+            # Distance from spawn (more = better)
+            score += 20.0 * self._manhattan(next_loc, self.spawn)
+            # Unvisited bonus
+            if next_loc not in self.visited_tiles:
+                score += 50.0
+            # Egg bonus
+            if mv[1] == MoveType.EGG:
+                score += 30.0
+            # Risk penalty
+            score -= 30.0 * self._risk_at(next_loc)
+            
+            if score > best_fallback_score:
+                best_fallback_score = score
+                best_fallback = mv
+        
+        return best_fallback
     
     def _opposite_dir(self, d: Direction) -> Direction:
         """Return the opposite direction."""
@@ -2164,22 +2656,29 @@ class PlayerAgent:
         dist = self._manhattan(loc, enemy_loc)
         
         # Base pressure from proximity (closer = more pressure)
+        # STRONGER bonuses for being close in midgame
         if dist <= 1:
-            pressure = 15.0
+            pressure = 20.0  # In their face
         elif dist <= 2:
-            pressure = 8.0
+            pressure = 12.0  # Very close
         elif dist <= 3:
-            pressure = 4.0
+            pressure = 6.0   # Pressuring
+        elif dist <= 4:
+            pressure = 3.0   # Within striking distance
         else:
             pressure = 0.0
         
         # Bonus if we're between enemy and open space
-        # Check if enemy has more unexplored tiles in our direction vs away
         enemy_to_us = (loc[0] - enemy_loc[0], loc[1] - enemy_loc[1])
         
         # Count unexplored tiles in each quadrant relative to enemy
         unexplored_toward_us = 0
         unexplored_away = 0
+        corners_toward_us = 0
+        parity_toward_us = 0
+        
+        corners = [(0, 0), (0, self.size - 1), (self.size - 1, 0), (self.size - 1, self.size - 1)]
+        
         for x in range(self.size):
             for y in range(self.size):
                 tile = (x, y)
@@ -2193,12 +2692,27 @@ class PlayerAgent:
                 dot = tile_dir[0] * enemy_to_us[0] + tile_dir[1] * enemy_to_us[1]
                 if dot > 0:
                     unexplored_toward_us += 1
+                    if tile in corners:
+                        corners_toward_us += 1
+                    if self._is_my_parity(tile):
+                        parity_toward_us += 1
                 else:
                     unexplored_away += 1
         
         # Bonus if we're blocking access to more unexplored tiles
-        if unexplored_toward_us > unexplored_away and unexplored_toward_us > 5:
-            pressure += 2.0
+        if unexplored_toward_us > unexplored_away:
+            pressure += 4.0  # We're blocking their expansion
+            if unexplored_toward_us > 8:
+                pressure += 3.0  # Blocking a lot of tiles
+        
+        # Extra bonus for blocking corners and parity tiles
+        pressure += 2.0 * corners_toward_us
+        pressure += 0.5 * parity_toward_us
+        
+        # Bonus for being on same row/column as enemy (limits their movement)
+        if loc[0] == enemy_loc[0] or loc[1] == enemy_loc[1]:
+            if dist <= 3:
+                pressure += 4.0  # Same axis = limiting their options
         
         return pressure
     
