@@ -1966,6 +1966,82 @@ class PlayerAgent:
 
         return score
     
+
+    # def _static_eval(self, board: Board) -> float:
+    #     """
+    #     Main evaluation function.
+
+    #     Phase-aware:
+    #     - Early / midgame: prioritize securing larger reachable territory
+    #       (Voronoi future eggs) over a tiny temporary egg lead.
+    #     - Endgame: current egg difference dominates, with some extra urgency.
+    #     """
+
+    #     # --- Core quantities ---
+    #     eggs_self = board.chicken_player.get_eggs_laid()
+    #     eggs_opp = board.chicken_enemy.get_eggs_laid()
+    #     egg_diff = eggs_self - eggs_opp
+
+    #     future_self, future_opp = self._voronoi_future_eggs(board)
+    #     future_diff = future_self - future_opp
+
+    #     mobility_self = len(board.get_valid_moves())
+    #     mobility_opp = len(board.get_valid_moves(enemy=True))
+    #     mobility_diff = mobility_self - mobility_opp
+
+    #     my_loc = board.chicken_player.get_location()
+    #     risk_here = self._risk_at(my_loc)
+    #     choke = self._enemy_choke_bonus(board, my_loc)
+
+    #     turns_left = board.turns_left_player
+
+    #     # --- Phase: 0 = opening, 1 = very late game ---
+    #     # We assume a typical game length of around 80 turns.
+    #     MAX_TURNS = 80.0
+    #     clamped_tl = max(0.0, min(float(turns_left), MAX_TURNS))
+    #     phase = 1.0 - (clamped_tl / MAX_TURNS)  # 0 early, 1 late
+
+    #     # Dynamic weights:
+    #     # - w_eggs: from ~40 early to ~120 late.
+    #     # - w_future: from ~24 early down to ~10 late.
+    #     w_eggs = 40.0 + 80.0 * phase
+    #     w_future = 24.0 - 14.0 * phase
+
+    #     score = 0.0
+
+    #     # --- Material + territory with phase-aware weights ---
+    #     score += w_eggs * float(egg_diff)
+    #     score += w_future * float(future_diff)
+
+    #     # --- Mobility & terminal-ish handling ---
+    #     score += 4.0 * float(mobility_diff)
+
+    #     if mobility_self == 0:
+    #         # We are dead / fully boxed in
+    #         score -= 2000.0
+    #     if mobility_opp == 0:
+    #         # Opponent is dead / boxed in
+    #         score += 2000.0
+
+    #     # --- Positional factors ---
+    #     score -= 40.0 * risk_here     # avoid self-traps / risky tiles
+    #     score += 15.0 * choke         # bonus for keeping opponent cramped
+
+    #     # --- Extra endgame urgency on eggs ---
+    #     if turns_left <= 12:
+    #         # As turns go down, push harder on current egg lead.
+    #         urgency = max(1, 4 - (turns_left // 4))  # 1..4
+    #         score += 30.0 * urgency * float(egg_diff)
+
+    #         # In ultra-late game, small mobility differences can decide last eggs.
+    #         if turns_left <= 4:
+    #             score += 2.0 * float(mobility_diff)
+    #     else:
+    #         # Very small "tempo" nudge so we don't waste moves early.
+    #         score -= 0.1 * float(turns_left)
+
+    #     return score
+
     def _voronoi_future_eggs(self, board: Board) -> Tuple[int, int]:
         """
         Estimate future egg potential for both players using a simple Voronoi
@@ -2041,6 +2117,7 @@ class PlayerAgent:
             future[pid] += 1
 
         return future[0], future[1]
+
 
     # ------------------------------------------------------------------ #
     # Opening guidance
