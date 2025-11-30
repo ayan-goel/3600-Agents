@@ -27,6 +27,23 @@ class TrapdoorBelief:
         self._min_likelihood = min_likelihood
         self._known_even: Optional[Tuple[int, int]] = None
         self._known_odd: Optional[Tuple[int, int]] = None
+        # Cache center-weighted prior (trapdoors are more likely near center)
+        self._center_weights = self._build_center_weights()
+        # Track tiles we've safely visited (no trapdoor there)
+        self._safe_tiles: set = set()
+        # Track strong signal history for better inference
+        self._signal_history: List[Tuple[Tuple[int, int], Tuple[bool, bool], Tuple[bool, bool]]] = []
+    
+    def _build_center_weights(self) -> np.ndarray:
+        """Build center-weighted prior matching trapdoor placement logic."""
+        dim = self.size
+        weights = np.zeros((dim, dim), dtype=np.float64)
+        # Edges have weight 0 (rings 0 and 1)
+        # Ring 2 (2 from edge) has weight 1
+        # Ring 3+ (center) has weight 2
+        weights[2:dim-2, 2:dim-2] = 1.0
+        weights[3:dim-3, 3:dim-3] = 2.0
+        return weights
 
     def reset(self) -> None:
         """Clear cached beliefs so the next update re-initializes them."""
@@ -57,9 +74,21 @@ class TrapdoorBelief:
         chicken: Chicken,
         sensory_data: List[Tuple[bool, bool]],
     ) -> None:
-        """Bayes update the belief grids given the latest sensory data."""
+        """Bayes update the belief grids given the latest sensory data.
+        
+        Also marks current location as safe and records signal history.
+        """
         if len(sensory_data) < 2:
             return
+        
+        # Mark current location as safe (we're here and didn't trigger trapdoor)
+        current_loc = chicken.get_location()
+        self.mark_safe(current_loc)
+        
+        # Record signal history for potential multi-observation inference
+        self._signal_history.append((current_loc, sensory_data[0], sensory_data[1]))
+        if len(self._signal_history) > 50:
+            self._signal_history.pop(0)
 
         if not self._initialized:
             self._init_uniform()
@@ -85,6 +114,11 @@ class TrapdoorBelief:
                     if (x + y) % 2 != target_parity:
                         belief[y, x] = 0.0
                         continue
+                    
+                    # Safe tiles have zero probability
+                    if (x, y) in self._safe_tiles:
+                        belief[y, x] = 0.0
+                        continue
 
                     prior = belief[y, x]
                     if prior <= 0.0:
@@ -108,44 +142,67 @@ class TrapdoorBelief:
                 break
 
     def _init_uniform(self) -> None:
-        """Initialize a uniform prior over valid cells of matching parity."""
-        even_mask = np.zeros_like(self.belief_even, dtype=bool)
-        odd_mask = np.zeros_like(self.belief_odd, dtype=bool)
+        """Initialize a CENTER-WEIGHTED prior over valid cells of matching parity.
+        
+        Trapdoors are placed with higher probability near the center:
+        - Edge tiles (rings 0-1): weight 0 (impossible)
+        - Ring 2: weight 1
+        - Center (ring 3+): weight 2
+        """
+        even_weights = np.zeros_like(self.belief_even, dtype=np.float64)
+        odd_weights = np.zeros_like(self.belief_odd, dtype=np.float64)
 
         for y in range(self.size):
             for x in range(self.size):
                 if not self._is_valid_cell(x, y):
                     continue
+                # Skip tiles we've safely visited
+                if (x, y) in self._safe_tiles:
+                    continue
+                weight = self._center_weights[y, x]
+                if weight <= 0:
+                    continue
                 if (x + y) % 2 == 0:
-                    even_mask[y, x] = True
+                    even_weights[y, x] = weight
                 else:
-                    odd_mask[y, x] = True
+                    odd_weights[y, x] = weight
 
         if self._known_even is not None:
             self.belief_even.fill(0.0)
             ex, ey = self._known_even
             self.belief_even[ey, ex] = 1.0
         else:
-            even_count = int(even_mask.sum())
-            if even_count == 0:
-                valid_mask = even_mask | odd_mask
-                count = max(int(valid_mask.sum()), 1)
-                self.belief_even[valid_mask] = 1.0 / count
+            total = even_weights.sum()
+            if total > 0:
+                self.belief_even = even_weights / total
             else:
-                self.belief_even[even_mask] = 1.0 / even_count
+                # Fallback to uniform if all weights are zero
+                even_mask = np.zeros_like(self.belief_even, dtype=bool)
+                for y in range(self.size):
+                    for x in range(self.size):
+                        if (x + y) % 2 == 0 and self._is_valid_cell(x, y):
+                            if (x, y) not in self._safe_tiles:
+                                even_mask[y, x] = True
+                count = max(int(even_mask.sum()), 1)
+                self.belief_even[even_mask] = 1.0 / count
 
         if self._known_odd is not None:
             self.belief_odd.fill(0.0)
             ox, oy = self._known_odd
             self.belief_odd[oy, ox] = 1.0
         else:
-            odd_count = int(odd_mask.sum())
-            if odd_count == 0:
-                valid_mask = even_mask | odd_mask
-                count = max(int(valid_mask.sum()), 1)
-                self.belief_odd[valid_mask] = 1.0 / count
+            total = odd_weights.sum()
+            if total > 0:
+                self.belief_odd = odd_weights / total
             else:
-                self.belief_odd[odd_mask] = 1.0 / odd_count
+                odd_mask = np.zeros_like(self.belief_odd, dtype=bool)
+                for y in range(self.size):
+                    for x in range(self.size):
+                        if (x + y) % 2 == 1 and self._is_valid_cell(x, y):
+                            if (x, y) not in self._safe_tiles:
+                                odd_mask[y, x] = True
+                count = max(int(odd_mask.sum()), 1)
+                self.belief_odd[odd_mask] = 1.0 / count
 
         self._initialized = True
 
@@ -176,7 +233,59 @@ class TrapdoorBelief:
         x, y = loc
         if not self._is_valid_cell(x, y):
             return 0.0
+        # If we've visited this tile safely, probability is 0
+        if loc in self._safe_tiles:
+            return 0.0
         if (x + y) % 2 == 0:
             return float(self.belief_even[y, x])
         return float(self.belief_odd[y, x])
+    
+    def mark_safe(self, loc: Tuple[int, int]) -> None:
+        """Mark a tile as safe (we visited it without triggering a trapdoor)."""
+        x, y = loc
+        if not self._is_valid_cell(x, y):
+            return
+        self._safe_tiles.add(loc)
+        # Zero out belief at this location
+        if (x + y) % 2 == 0:
+            if self.belief_even[y, x] > 0:
+                self.belief_even[y, x] = 0.0
+                total = self.belief_even.sum()
+                if total > 0:
+                    self.belief_even /= total
+        else:
+            if self.belief_odd[y, x] > 0:
+                self.belief_odd[y, x] = 0.0
+                total = self.belief_odd.sum()
+                if total > 0:
+                    self.belief_odd /= total
+    
+    def get_danger_zone(self, threshold: float = 0.15) -> set:
+        """Return set of tiles with trapdoor probability above threshold."""
+        if not self._initialized:
+            self._init_uniform()
+        danger = set()
+        for y in range(self.size):
+            for x in range(self.size):
+                if (x, y) in self._safe_tiles:
+                    continue
+                prob = self.trapdoor_prob_at((x, y))
+                if prob >= threshold:
+                    danger.add((x, y))
+        return danger
+    
+    def get_high_risk_tiles(self, top_n: int = 4) -> List[Tuple[Tuple[int, int], float]]:
+        """Return the top N highest-probability trapdoor locations."""
+        if not self._initialized:
+            self._init_uniform()
+        candidates = []
+        for y in range(self.size):
+            for x in range(self.size):
+                if (x, y) in self._safe_tiles:
+                    continue
+                prob = self.trapdoor_prob_at((x, y))
+                if prob > 0:
+                    candidates.append(((x, y), prob))
+        candidates.sort(key=lambda t: t[1], reverse=True)
+        return candidates[:top_n]
 

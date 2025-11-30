@@ -764,3 +764,4 @@ class PlayerAgent:
     def _is_my_parity(self, loc: Tuple[int, int]) -> bool:
         return (loc[0] + loc[1]) % 2 == self.my_parity
 
+
