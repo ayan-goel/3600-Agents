@@ -307,76 +307,76 @@ class PlayerAgent:
                 best_target = max(target_tiles, key=tile_score) if target_tiles else None
                 
                 if best_target:
-                    cur_dist = self._manhattan(cur_loc, best_target)
-                    
+                cur_dist = self._manhattan(cur_loc, best_target)
+                
                     # RECOVERY URGENCY: Higher when further behind
                     urgency = 1.0 + 0.2 * max(0, egg_deficit)
                     
-                    best_recovery = None
-                    best_recovery_score = -1e9
-                    for mv in legal_moves:
-                        recovery_loc = loc_after_direction(cur_loc, mv[0])
-                        if not board.is_valid_cell(recovery_loc) or board.is_cell_blocked(recovery_loc):
-                            continue
-                        
-                        score = 0.0
-                        new_dist = self._manhattan(recovery_loc, best_target)
-                        progress = cur_dist - new_dist
-                        
+                best_recovery = None
+                best_recovery_score = -1e9
+                for mv in legal_moves:
+                    recovery_loc = loc_after_direction(cur_loc, mv[0])
+                    if not board.is_valid_cell(recovery_loc) or board.is_cell_blocked(recovery_loc):
+                        continue
+                    
+                    score = 0.0
+                    new_dist = self._manhattan(recovery_loc, best_target)
+                    progress = cur_dist - new_dist
+                    
                         # Progress toward safe target area
                         score += 150.0 * urgency * progress
-                        
-                        # MASSIVE bonus for unvisited tiles
-                        if recovery_loc not in self.visited_tiles:
+                    
+                    # MASSIVE bonus for unvisited tiles
+                    if recovery_loc not in self.visited_tiles:
                             score += 350.0 * urgency
-                        
-                        # Bonus for tiles with many unexplored neighbors
-                        nearby_unexplored = count_nearby_unexplored(recovery_loc)
+                    
+                    # Bonus for tiles with many unexplored neighbors
+                    nearby_unexplored = count_nearby_unexplored(recovery_loc)
                         score += 25.0 * nearby_unexplored
-                        
+                    
                         # Moving AWAY from enemy is good during recovery
                         enemy_dist_now = self._manhattan(cur_loc, enemy_loc)
                         enemy_dist_next = self._manhattan(recovery_loc, enemy_loc)
                         if enemy_dist_next > enemy_dist_now:
                             score += 60.0  # Getting away from enemy
-                        
+                    
                         # EXTRA BONUS for egg moves - we're behind and need to catch up!
-                        if mv[1] == MoveType.EGG:
+                    if mv[1] == MoveType.EGG:
                             score += 200.0 * urgency  # Much higher priority on eggs when behind
-                        
-                        # Bonus for parity
-                        if self._is_my_parity(recovery_loc):
+                    
+                    # Bonus for parity
+                    if self._is_my_parity(recovery_loc):
                             score += 40.0
-                        
+                    
                         # STRONG penalty for already visited
-                        if recovery_loc in self.visited_tiles:
+                    if recovery_loc in self.visited_tiles:
                             score -= 250.0
-                        
+                    
                         # Moving toward spawn is bad (we just came from there)
-                        spawn_dist_now = self._manhattan(cur_loc, self.spawn)
-                        spawn_dist_next = self._manhattan(recovery_loc, self.spawn)
-                        if spawn_dist_next < spawn_dist_now:
+                    spawn_dist_now = self._manhattan(cur_loc, self.spawn)
+                    spawn_dist_next = self._manhattan(recovery_loc, self.spawn)
+                    if spawn_dist_next < spawn_dist_now:
                             score -= 120.0
                         
                         # STRONG penalty for center tiles (trapdoor zone!)
                         rx, ry = recovery_loc
                         if 2 <= rx <= 5 and 2 <= ry <= 5:
                             score -= 150.0  # Avoid center during recovery
-                        
-                        # Penalty for risk
-                        score -= 60.0 * self._risk_at(recovery_loc)
-                        
-                        if score > best_recovery_score:
-                            best_recovery_score = score
-                            best_recovery = mv
                     
+                    # Penalty for risk
+                        score -= 60.0 * self._risk_at(recovery_loc)
+                    
+                    if score > best_recovery_score:
+                        best_recovery_score = score
+                        best_recovery = mv
+                
                     # Use recovery move, but ALWAYS take eggs if available (we're behind!)
                     if best_recovery is not None:
                         # Exception: if current choice is an egg, keep it!
                         if choice[1] == MoveType.EGG:
                             pass  # Keep the egg move
                         elif best_recovery[1] == MoveType.EGG or best_recovery_score > 0:
-                            choice = best_recovery
+                    choice = best_recovery
         
         # HARD OSCILLATION OVERRIDE: if stuck in small area, force escape
         # Check for oscillation in last 8 moves - trigger if 4 or fewer unique tiles
@@ -769,66 +769,66 @@ class PlayerAgent:
             
             # ALWAYS try to intercept - be MORE aggressive when behind
             # When behind: priority is to limit opponent's territory expansion
-            predicted_dir = self._predict_enemy_direction()
-            if predicted_dir is not None:
-                # Where is enemy heading?
-                predicted_enemy_next = loc_after_direction(enemy_loc, predicted_dir)
-                
-                # Is enemy heading toward open space we haven't visited?
-                enemy_heading_to_open = predicted_enemy_next not in self.visited_tiles
+                predicted_dir = self._predict_enemy_direction()
+                if predicted_dir is not None:
+                    # Where is enemy heading?
+                    predicted_enemy_next = loc_after_direction(enemy_loc, predicted_dir)
+                    
+                    # Is enemy heading toward open space we haven't visited?
+                    enemy_heading_to_open = predicted_enemy_next not in self.visited_tiles
                 
                 # Intercept distance increases when we're behind (more desperate)
                 max_intercept_dist = 4 if egg_deficit <= 2 else (6 if egg_deficit <= 5 else 8)
-                
-                if enemy_heading_to_open:
-                    # Check if we can intercept
-                    dist_to_intercept = self._manhattan(cur_loc, predicted_enemy_next)
                     
-                    if dist_to_intercept <= max_intercept_dist:
-                        next_loc = loc_after_direction(cur_loc, choice[0])
-                        cur_dist_to_enemy_path = self._manhattan(cur_loc, predicted_enemy_next)
-                        next_dist_to_enemy_path = self._manhattan(next_loc, predicted_enemy_next)
+                    if enemy_heading_to_open:
+                        # Check if we can intercept
+                        dist_to_intercept = self._manhattan(cur_loc, predicted_enemy_next)
                         
-                        # If current choice isn't moving toward intercept, consider override
-                        if next_dist_to_enemy_path >= cur_dist_to_enemy_path and choice[1] != MoveType.EGG:
-                            best_intercept = None
-                            best_intercept_score = -1e9
+                    if dist_to_intercept <= max_intercept_dist:
+                            next_loc = loc_after_direction(cur_loc, choice[0])
+                            cur_dist_to_enemy_path = self._manhattan(cur_loc, predicted_enemy_next)
+                            next_dist_to_enemy_path = self._manhattan(next_loc, predicted_enemy_next)
+                            
+                            # If current choice isn't moving toward intercept, consider override
+                            if next_dist_to_enemy_path >= cur_dist_to_enemy_path and choice[1] != MoveType.EGG:
+                                best_intercept = None
+                                best_intercept_score = -1e9
                             
                             # Urgency multiplier: higher when behind
                             urgency = 1.0 + 0.3 * max(0, egg_deficit)
                             
-                            for mv in legal_moves:
-                                intercept_loc = loc_after_direction(cur_loc, mv[0])
-                                if not board.is_valid_cell(intercept_loc) or board.is_cell_blocked(intercept_loc):
-                                    continue
-                                
-                                new_dist = self._manhattan(intercept_loc, predicted_enemy_next)
-                                progress = cur_dist_to_enemy_path - new_dist
-                                
+                                for mv in legal_moves:
+                                    intercept_loc = loc_after_direction(cur_loc, mv[0])
+                                    if not board.is_valid_cell(intercept_loc) or board.is_cell_blocked(intercept_loc):
+                                        continue
+                                    
+                                    new_dist = self._manhattan(intercept_loc, predicted_enemy_next)
+                                    progress = cur_dist_to_enemy_path - new_dist
+                                    
                                 score = 30.0 * urgency * progress  # Bonus for getting closer to intercept
-                                
-                                # Bonus if this move also explores
-                                if intercept_loc not in self.visited_tiles:
+                                    
+                                    # Bonus if this move also explores
+                                    if intercept_loc not in self.visited_tiles:
                                     score += 40.0 * urgency
                                 # Bonus for egg moves (still score points!)
-                                if mv[1] == MoveType.EGG:
+                                    if mv[1] == MoveType.EGG:
                                     score += 35.0
                                 # TURD bonus when behind - block opponent's path!
                                 if mv[1] == MoveType.TURD and egg_deficit >= 3:
                                     # Check if turd would block enemy's likely path
                                     if self._manhattan(cur_loc, enemy_loc) <= 3:
                                         score += 50.0  # Strategic turd to block
-                                # Penalty for risk
-                                score -= 30.0 * self._risk_at(intercept_loc)
+                                    # Penalty for risk
+                                    score -= 30.0 * self._risk_at(intercept_loc)
+                                    
+                                    if score > best_intercept_score:
+                                        best_intercept_score = score
+                                        best_intercept = mv
                                 
-                                if score > best_intercept_score:
-                                    best_intercept_score = score
-                                    best_intercept = mv
-                            
                             # Lower threshold when behind - be more willing to intercept
                             threshold = 20.0 if egg_deficit <= 2 else 10.0
                             if best_intercept is not None and best_intercept_score > threshold:
-                                choice = best_intercept
+                                    choice = best_intercept
         
         # MALDINI: AGGRESSIVE MIDGAME SHADOWING
         # Get within 2-3 tiles of opponent and MIRROR their movement
@@ -970,7 +970,7 @@ class PlayerAgent:
             right_control = our_eggs_right - enemy_eggs_right
             
             # Find which quadrant we should RACE to claim
-            target_quadrant = None
+                target_quadrant = None
             urgency = 1.0
             
             # PROACTIVE: If opponent is heading toward an unclaimed area, race there!
@@ -979,11 +979,11 @@ class PlayerAgent:
             
             if enemy_on_right and right_control < 0:
                 # Enemy is on right AND dominating it - pivot to left!
-                target_quadrant = "left"
+                        target_quadrant = "left"
                 urgency = 1.5
             elif enemy_on_left and left_control < 0:
                 # Enemy is on left AND dominating it - pivot to right!
-                target_quadrant = "right"
+                        target_quadrant = "right"
                 urgency = 1.5
             elif right_control < left_control - 2:
                 # We're weaker on right, target it
@@ -1003,28 +1003,28 @@ class PlayerAgent:
                 elif right_unexplored > left_unexplored + 3:
                     target_quadrant = "right"
                     urgency = 2.0 if egg_diff < -3 else 1.5
-            
-            if target_quadrant is not None:
-                # Find unexplored tiles in target quadrant
-                target_tiles = []
-                for x in range(self.size):
-                    for y in range(self.size):
-                        tile = (x, y)
-                        if tile in self.visited_tiles:
-                            continue
-                        if board.is_cell_blocked(tile):
-                            continue
-                        
-                        in_target = False
-                        if target_quadrant == "left" and x < mid:
-                            in_target = True
-                        elif target_quadrant == "right" and x >= mid:
-                            in_target = True
-                        
-                        if in_target:
-                            target_tiles.append(tile)
                 
-                if target_tiles:
+                if target_quadrant is not None:
+                    # Find unexplored tiles in target quadrant
+                    target_tiles = []
+                    for x in range(self.size):
+                        for y in range(self.size):
+                            tile = (x, y)
+                            if tile in self.visited_tiles:
+                                continue
+                            if board.is_cell_blocked(tile):
+                                continue
+                            
+                            in_target = False
+                            if target_quadrant == "left" and x < mid:
+                                in_target = True
+                            elif target_quadrant == "right" and x >= mid:
+                                in_target = True
+                            
+                            if in_target:
+                                target_tiles.append(tile)
+                    
+                    if target_tiles:
                     # Find closest target tile with most unexplored neighbors
                     def tile_value(t):
                         dist = self._manhattan(cur_loc, t)
@@ -1033,41 +1033,41 @@ class PlayerAgent:
                         return dist - neighbors * 0.5  # Lower is better
                     
                     closest_target = min(target_tiles, key=tile_value)
-                    next_loc = loc_after_direction(cur_loc, choice[0])
-                    cur_dist = self._manhattan(cur_loc, closest_target)
-                    next_dist = self._manhattan(next_loc, closest_target)
-                    
-                    # If current choice doesn't help us get to target quadrant
-                    if next_dist >= cur_dist and choice[1] != MoveType.EGG:
-                        best_territory = None
-                        best_territory_score = -1e9
-                        for mv in legal_moves:
-                            terr_loc = loc_after_direction(cur_loc, mv[0])
-                            if not board.is_valid_cell(terr_loc) or board.is_cell_blocked(terr_loc):
-                                continue
-                            
-                            new_dist = self._manhattan(terr_loc, closest_target)
-                            progress = cur_dist - new_dist
-                            
-                            score = 40.0 * urgency * progress
-                            
-                            if terr_loc not in self.visited_tiles:
-                                score += 60.0 * urgency
-                            if mv[1] == MoveType.EGG:
-                                score += 50.0
-                            if self._is_my_parity(terr_loc):
-                                score += 15.0
-                            
-                            score -= 40.0 * self._risk_at(terr_loc)
-                            
-                            if score > best_territory_score:
-                                best_territory_score = score
-                                best_territory = mv
+                        next_loc = loc_after_direction(cur_loc, choice[0])
+                        cur_dist = self._manhattan(cur_loc, closest_target)
+                        next_dist = self._manhattan(next_loc, closest_target)
                         
+                    # If current choice doesn't help us get to target quadrant
+                        if next_dist >= cur_dist and choice[1] != MoveType.EGG:
+                            best_territory = None
+                            best_territory_score = -1e9
+                            for mv in legal_moves:
+                                terr_loc = loc_after_direction(cur_loc, mv[0])
+                                if not board.is_valid_cell(terr_loc) or board.is_cell_blocked(terr_loc):
+                                    continue
+                                
+                                new_dist = self._manhattan(terr_loc, closest_target)
+                                progress = cur_dist - new_dist
+                                
+                            score = 40.0 * urgency * progress
+                                
+                                if terr_loc not in self.visited_tiles:
+                                score += 60.0 * urgency
+                                if mv[1] == MoveType.EGG:
+                                    score += 50.0
+                                if self._is_my_parity(terr_loc):
+                                    score += 15.0
+                                
+                                score -= 40.0 * self._risk_at(terr_loc)
+                                
+                                if score > best_territory_score:
+                                    best_territory_score = score
+                                    best_territory = mv
+                            
                         # Lower threshold when behind or urgent
                         threshold = 15.0 if egg_diff < -2 else 25.0
                         if best_territory is not None and best_territory_score > threshold:
-                            choice = best_territory
+                                choice = best_territory
         
         # MALDINI: ENDGAME EXPLORATION & CORNER SEEKING
         # In late game, prioritize reaching unexplored regions OR corners
@@ -1194,12 +1194,12 @@ class PlayerAgent:
             # When ahead: turds are less valuable, focus on eggs
             if egg_diff >= 2:
                 # We're ahead - be conservative with turds
-                should_block_turd = (
-                    self.trapdoor_recovery_mode or
-                    board.turn_count < 25 or
-                    board.turns_left_player < 15 or
-                    turds_left <= 1
-                )
+            should_block_turd = (
+                self.trapdoor_recovery_mode or
+                board.turn_count < 25 or
+                board.turns_left_player < 15 or
+                turds_left <= 1
+            )
             elif egg_diff >= -2:
                 # Close game - use turds strategically
                 should_block_turd = (
@@ -2310,17 +2310,17 @@ class PlayerAgent:
             candidates = [mv for mv in legal_moves if mv[0] == direction]
             if not candidates:
                 return None
-            if need_to_catch_up:
-                plain_moves = [mv for mv in candidates if mv[1] == MoveType.PLAIN]
-                if plain_moves:
-                    return plain_moves[0]
+                    if need_to_catch_up:
+                        plain_moves = [mv for mv in candidates if mv[1] == MoveType.PLAIN]
+                        if plain_moves:
+                            return plain_moves[0]
             if prefer_eggs and board.can_lay_egg() and self._risk_at(cur) < 0.7:
-                egg_moves = [mv for mv in candidates if mv[1] == MoveType.EGG]
-                if egg_moves:
-                    return egg_moves[0]
-            plain_moves = [mv for mv in candidates if mv[1] == MoveType.PLAIN]
-            if plain_moves:
-                return plain_moves[0]
+                        egg_moves = [mv for mv in candidates if mv[1] == MoveType.EGG]
+                        if egg_moves:
+                            return egg_moves[0]
+                    plain_moves = [mv for mv in candidates if mv[1] == MoveType.PLAIN]
+                    if plain_moves:
+                        return plain_moves[0]
             return candidates[0] if candidates else None
         
         # Phase 1: Vertical sweep to corner - GO FAST

@@ -193,6 +193,7 @@ class PlayerAgent:
         self._deadline = 0.0
         self._cached_potential = 0.0
         self._danger_zone: Set[Tuple[int, int]] = set()
+        self._is_endgame = False
 
     def play(
         self,
@@ -208,6 +209,9 @@ class PlayerAgent:
         self.visit_counts[my_loc] = self.visit_counts.get(my_loc, 0) + 1
         
         self._danger_zone = self.trap_belief.get_high_risk_tiles(0.08)
+        
+        # Endgame detection: last ~20 moves (turn_count >= 60 out of ~80)
+        self._is_endgame = board.turn_count >= 60
         
         self.tt.clear()
         
@@ -256,6 +260,33 @@ class PlayerAgent:
         if board.can_lay_egg():
             eggs = [m for m in moves if m[1] == MoveType.EGG]
             if eggs:
+                # In endgame, prioritize eggs but still avoid high-risk trapdoor tiles
+                if self._is_endgame:
+                    safe_eggs = []
+                    moderate_eggs = []
+                    risky_eggs = []
+                    for m in eggs:
+                        nl = loc_after_direction(cur, m[0])
+                        risk = self.trap_belief.get_total_risk(nl)
+                        if risk < 0.20:  # Slightly more permissive than normal
+                            safe_eggs.append((m, risk))
+                        elif risk < 0.35:  # Moderate risk - acceptable in endgame
+                            moderate_eggs.append((m, risk))
+                        else:
+                            risky_eggs.append((m, risk))
+                    
+                    # Prefer safe eggs, then moderate, avoid truly risky ones
+                    if safe_eggs:
+                        safe_eggs.sort(key=lambda x: x[1])
+                        return [x[0] for x in safe_eggs]
+                    if moderate_eggs:
+                        moderate_eggs.sort(key=lambda x: x[1])
+                        return [x[0] for x in moderate_eggs]
+                    # Only take risky eggs if no other option
+                    if risky_eggs:
+                        risky_eggs.sort(key=lambda x: x[1])
+                        return [x[0] for x in risky_eggs]
+                
                 safe_eggs = []
                 risky_eggs = []
                 for m in eggs:
@@ -365,16 +396,22 @@ class PlayerAgent:
     def _eval(self, board: Board) -> float:
         me = board.chicken_player.get_eggs_laid()
         en = board.chicken_enemy.get_eggs_laid()
-        score = (me - en) * 15.0
+        
+        # In endgame, eggs matter more but still respect trapdoor risk
+        egg_weight = 30.0 if self._is_endgame else 15.0
+        score = (me - en) * egg_weight
 
         my_loc = board.chicken_player.get_location()
         en_loc = board.chicken_enemy.get_location()
 
         risk = self.trap_belief.get_total_risk(my_loc)
-        score -= risk * 150.0
+        # Keep meaningful risk penalty even in endgame - trapdoors still kill
+        risk_penalty = 100.0 if self._is_endgame else 150.0
+        score -= risk * risk_penalty
         
         if my_loc in self._danger_zone:
-            score -= 50.0
+            danger_penalty = 35.0 if self._is_endgame else 50.0
+            score -= danger_penalty
 
         vc = self.visit_counts.get(my_loc, 0)
         score -= 3.0 * max(0, vc - 1)
