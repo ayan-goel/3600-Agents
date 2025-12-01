@@ -40,17 +40,48 @@ class PlayerAgent:
         self.safety_buffer = 0.08
         self.min_budget = 0.03
         self._lane_dir = Direction.RIGHT if self.spawn[0] <= self.size // 2 else Direction.LEFT
-        self._vertical_bias = (
-            Direction.UP if self.spawn[1] > (self.size // 2) else Direction.DOWN
-        )
-        # MALDINI: Perimeter sweep strategy
-        # Determine our sweep direction: go vertical first (up or down), then cut across
-        # If we spawn on left (x=0), we go vertical on left edge, then sweep right
-        # If we spawn on right (x=7), we go vertical on right edge, then sweep left
-        self._sweep_vertical = self._vertical_bias  # UP or DOWN based on spawn y
-        self._sweep_horizontal = Direction.RIGHT if self.spawn[0] == 0 else Direction.LEFT
-        self._perimeter_phase = "vertical"  # "vertical" -> "cut_in" -> "done"
-        self._cut_in_turn = -1  # Turn when we should cut inward
+        
+        # MALDINI: FARTHEST CORNER SWEEP STRATEGY
+        # Key insight: Go to the FARTHEST corner to claim MAXIMUM territory
+        # Then sweep horizontally to cut off opponent
+        spawn_x, spawn_y = self.spawn
+        mid = self.size // 2
+        
+        # Horizontal sweep direction (always toward opponent)
+        self._sweep_horizontal = Direction.RIGHT if spawn_x == 0 else Direction.LEFT
+        
+        # Calculate distances to vertical edges
+        dist_to_top = spawn_y  # tiles to y=0
+        dist_to_bottom = self.size - 1 - spawn_y  # tiles to y=size-1
+        
+        # Go to FARTHEST vertical edge to maximize territory
+        if dist_to_bottom > dist_to_top:
+            self._sweep_vertical = Direction.DOWN
+            self._vertical_bias = Direction.DOWN
+        elif dist_to_top > dist_to_bottom:
+            self._sweep_vertical = Direction.UP
+            self._vertical_bias = Direction.UP
+        else:
+            # Equal distance - go DOWN by default
+            self._sweep_vertical = Direction.DOWN
+            self._vertical_bias = Direction.DOWN
+        
+        # Check if we're already close to a corner (skip vertical phase)
+        close_to_top = dist_to_top <= 1
+        close_to_bottom = dist_to_bottom <= 1
+        
+        if close_to_top:
+            self._sweep_vertical = Direction.UP
+            self._vertical_bias = Direction.UP
+            self._perimeter_phase = "horizontal"
+        elif close_to_bottom:
+            self._sweep_vertical = Direction.DOWN
+            self._vertical_bias = Direction.DOWN
+            self._perimeter_phase = "horizontal"
+        else:
+            self._perimeter_phase = "vertical"  # "vertical" -> "horizontal" -> "fill" -> "done"
+        
+        self._cut_in_turn = -1  # Turn when we switch phases
         
         self._opening_script = self._build_opening_script()
         self.loop_targets = self._build_loop_targets()
@@ -798,6 +829,125 @@ class PlayerAgent:
                             threshold = 20.0 if egg_deficit <= 2 else 10.0
                             if best_intercept is not None and best_intercept_score > threshold:
                                 choice = best_intercept
+        
+        # MALDINI: AGGRESSIVE MIDGAME SHADOWING
+        # Get within 2-3 tiles of opponent and MIRROR their movement
+        # While laying eggs to dominate the space they want to claim
+        if self.phase == "midgame" and 16 <= board.turn_count <= 70:
+            enemy_loc = board.chicken_enemy.get_location()
+            dist_to_enemy = self._manhattan(cur_loc, enemy_loc)
+            my_eggs = board.chicken_player.get_eggs_laid()
+            opp_eggs = board.chicken_enemy.get_eggs_laid()
+            
+            # Predict enemy direction
+            enemy_dir = self._predict_enemy_direction()
+            
+            # TARGET DISTANCE: We want to be 2-3 tiles from opponent
+            ideal_dist = 3
+            too_far = dist_to_enemy > 4
+            
+            # If we're too far, close the gap AGGRESSIVELY
+            if too_far:
+                best_chase = None
+                best_chase_score = -1e9
+                
+                for mv in legal_moves:
+                    chase_loc = loc_after_direction(cur_loc, mv[0])
+                    if not board.is_valid_cell(chase_loc) or board.is_cell_blocked(chase_loc):
+                        continue
+                    
+                    new_dist = self._manhattan(chase_loc, enemy_loc)
+                    closing = dist_to_enemy - new_dist
+                    
+                    score = 80.0 * closing  # Strong bonus for closing distance
+                    
+                    # Huge bonus for unvisited tiles (claim territory while chasing)
+                    if chase_loc not in self.visited_tiles:
+                        score += 60.0
+                    
+                    # Bonus for eggs (score points while chasing)
+                    if mv[1] == MoveType.EGG:
+                        score += 50.0
+                    
+                    # If we know where enemy is going, get ahead of them!
+                    if enemy_dir is not None:
+                        enemy_target = loc_after_direction(enemy_loc, enemy_dir)
+                        if self._in_bounds(enemy_target):
+                            our_dist_to_target = self._manhattan(chase_loc, enemy_target)
+                            enemy_dist_to_target = 1  # Enemy is 1 step from their target
+                            if our_dist_to_target <= enemy_dist_to_target + 1:
+                                score += 100.0  # We can beat them there!
+                    
+                    # Risk penalty
+                    score -= 25.0 * self._risk_at(chase_loc)
+                    
+                    if score > best_chase_score:
+                        best_chase_score = score
+                        best_chase = mv
+                
+                if best_chase is not None and best_chase_score > 50.0:
+                    choice = best_chase
+            
+            # If we're at ideal distance (2-4), SHADOW the opponent
+            elif 2 <= dist_to_enemy <= 4 and enemy_dir is not None:
+                # Mirror enemy's movement direction while laying eggs!
+                # Stay parallel to block their expansion path
+                
+                # Find move that maintains distance but blocks their path
+                best_shadow = None
+                best_shadow_score = -1e9
+                
+                for mv in legal_moves:
+                    shadow_loc = loc_after_direction(cur_loc, mv[0])
+                    if not board.is_valid_cell(shadow_loc) or board.is_cell_blocked(shadow_loc):
+                        continue
+                    
+                    new_dist = self._manhattan(shadow_loc, enemy_loc)
+                    
+                    score = 0.0
+                    
+                    # Maintain ideal distance (2-3)
+                    if 2 <= new_dist <= 4:
+                        score += 50.0  # Good shadowing distance
+                    elif new_dist < 2:
+                        score -= 20.0  # Too close - might collide
+                    else:
+                        score -= 30.0 * (new_dist - 4)  # Getting too far
+                    
+                    # MIRROR BONUS: If we move in same direction as enemy, we stay parallel
+                    if mv[0] == enemy_dir:
+                        score += 60.0  # Mirroring their movement!
+                    
+                    # BLOCKING BONUS: If we're between enemy and unexplored space
+                    if enemy_dir is not None:
+                        enemy_target = loc_after_direction(enemy_loc, enemy_dir)
+                        if self._in_bounds(enemy_target):
+                            # Are we cutting them off?
+                            our_dist_to_target = self._manhattan(shadow_loc, enemy_target)
+                            if our_dist_to_target <= 2:
+                                score += 70.0  # Blocking their path!
+                    
+                    # Huge bonus for unvisited (claim territory while shadowing)
+                    if shadow_loc not in self.visited_tiles:
+                        score += 55.0
+                    
+                    # STRONG egg bonus - lay eggs while shadowing!
+                    if mv[1] == MoveType.EGG:
+                        score += 65.0  # Shadow AND score!
+                    
+                    # Parity bonus
+                    if self._is_my_parity(shadow_loc):
+                        score += 20.0
+                    
+                    # Risk penalty
+                    score -= 25.0 * self._risk_at(shadow_loc)
+                    
+                    if score > best_shadow_score:
+                        best_shadow_score = score
+                        best_shadow = mv
+                
+                if best_shadow is not None and best_shadow_score > 40.0:
+                    choice = best_shadow
         
         # MALDINI: PROACTIVE TERRITORIAL CONTROL
         # KEY FIX: Don't wait for opponent to dominate - RACE for territory!
@@ -2149,93 +2299,84 @@ class PlayerAgent:
                 return True
             return False
         
-        # Phase 1: Vertical sweep - GO FAST
-        if self._perimeter_phase == "vertical":
-            # Switch to cut-in if we hit edge OR we've done enough vertical
-            if at_vertical_edge:
-                self._perimeter_phase = "cut_in"
-                self._cut_in_turn = board.turn_count
-            else:
-                # PRIORITY 1: Keep moving vertically - speed is key!
-                desired_dir = self._sweep_vertical
-                candidates = [mv for mv in legal_moves if mv[0] == desired_dir]
-                
-                if candidates:
-                    # If we're behind on expansion, ALWAYS move (don't stop to egg)
-                    if need_to_catch_up:
-                        plain_moves = [mv for mv in candidates if mv[1] == MoveType.PLAIN]
-                        if plain_moves:
-                            return plain_moves[0]
-                    
-                    # Otherwise, egg if we can (but prefer plain to keep moving)
-                    if board.can_lay_egg() and self._risk_at(cur) < 0.7:
-                        egg_moves = [mv for mv in candidates if mv[1] == MoveType.EGG]
-                        if egg_moves:
-                            return egg_moves[0]
-                    
-                    plain_moves = [mv for mv in candidates if mv[1] == MoveType.PLAIN]
-                    if plain_moves:
-                        return plain_moves[0]
-                
-                # Can't go vertical - try horizontal toward center (never backward!)
-                horiz_dir = self._sweep_horizontal
-                horiz_candidates = [mv for mv in legal_moves if mv[0] == horiz_dir]
-                if horiz_candidates:
-                    plain_moves = [mv for mv in horiz_candidates if mv[1] == MoveType.PLAIN]
-                    if plain_moves:
-                        # Still in vertical phase, just stepping around obstacle
-                        return plain_moves[0]
-                
-                # If blocked everywhere forward, switch to cut-in
-                self._perimeter_phase = "cut_in"
-                self._cut_in_turn = board.turn_count
+        # Check if we've reached horizontal edge
+        at_left = cur[0] == 0
+        at_right = cur[0] == self.size - 1
+        at_horizontal_edge = (self._sweep_horizontal == Direction.RIGHT and at_right) or \
+                            (self._sweep_horizontal == Direction.LEFT and at_left)
         
-        # Phase 2: Cut inward toward center/enemy territory
-        if self._perimeter_phase == "cut_in":
-            # Primary: horizontal toward center
-            desired_dir = self._sweep_horizontal
-            candidates = [mv for mv in legal_moves if mv[0] == desired_dir]
-            
-            if candidates:
-                # If behind, prioritize movement over eggs
-                if need_to_catch_up:
-                    plain_moves = [mv for mv in candidates if mv[1] == MoveType.PLAIN]
-                    if plain_moves:
-                        return plain_moves[0]
-                
-                if board.can_lay_egg() and self._risk_at(cur) < 0.7:
-                    egg_moves = [mv for mv in candidates if mv[1] == MoveType.EGG]
-                    if egg_moves:
-                        return egg_moves[0]
-                
+        # Helper to pick move in direction
+        def pick_move_in_direction(direction: Direction, prefer_eggs: bool = True):
+            candidates = [mv for mv in legal_moves if mv[0] == direction]
+            if not candidates:
+                return None
+            if need_to_catch_up:
                 plain_moves = [mv for mv in candidates if mv[1] == MoveType.PLAIN]
                 if plain_moves:
                     return plain_moves[0]
-            
-            # Secondary: continue vertical or opposite vertical (but NEVER retreat!)
-            for alt_dir in [self._sweep_vertical, self._opposite_dir(self._sweep_vertical)]:
-                if is_retreat(alt_dir):
-                    continue  # NEVER retreat toward spawn
+            if prefer_eggs and board.can_lay_egg() and self._risk_at(cur) < 0.7:
+                egg_moves = [mv for mv in candidates if mv[1] == MoveType.EGG]
+                if egg_moves:
+                    return egg_moves[0]
+            plain_moves = [mv for mv in candidates if mv[1] == MoveType.PLAIN]
+            if plain_moves:
+                return plain_moves[0]
+            return candidates[0] if candidates else None
+        
+        # Phase 1: Vertical sweep to corner - GO FAST
+        if self._perimeter_phase == "vertical":
+            if at_vertical_edge:
+                self._perimeter_phase = "horizontal"
+                self._cut_in_turn = board.turn_count
+            else:
+                move = pick_move_in_direction(self._sweep_vertical)
+                if move:
+                    return move
                 
-                alt_candidates = [mv for mv in legal_moves if mv[0] == alt_dir]
-                if alt_candidates:
-                    if need_to_catch_up:
-                        plain_moves = [mv for mv in alt_candidates if mv[1] == MoveType.PLAIN]
-                        if plain_moves:
-                            return plain_moves[0]
-                    
-                    if board.can_lay_egg() and self._risk_at(cur) < 0.7:
-                        egg_moves = [mv for mv in alt_candidates if mv[1] == MoveType.EGG]
-                        if egg_moves:
-                            return egg_moves[0]
-                    
-                    plain_moves = [mv for mv in alt_candidates if mv[1] == MoveType.PLAIN]
-                    if plain_moves:
-                        return plain_moves[0]
+                # Blocked - try stepping horizontal
+                move = pick_move_in_direction(self._sweep_horizontal, prefer_eggs=False)
+                if move:
+                    return move
+                
+                self._perimeter_phase = "horizontal"
+                self._cut_in_turn = board.turn_count
+        
+        # Phase 2: Horizontal sweep toward opponent
+        if self._perimeter_phase == "horizontal":
+            if at_horizontal_edge:
+                self._perimeter_phase = "fill"
+                self._cut_in_turn = board.turn_count
+            else:
+                move = pick_move_in_direction(self._sweep_horizontal)
+                if move:
+                    return move
+                
+                # Blocked - try vertical to get around
+                move = pick_move_in_direction(self._sweep_vertical, prefer_eggs=False)
+                if move:
+                    return move
+                
+                opposite_vert = self._opposite_dir(self._sweep_vertical)
+                move = pick_move_in_direction(opposite_vert, prefer_eggs=False)
+                if move:
+                    return move
+        
+        # Phase 3: Fill - vertical sweep in opposite direction
+        if self._perimeter_phase == "fill":
+            opposite_vert = self._opposite_dir(self._sweep_vertical)
+            at_opposite_edge = (opposite_vert == Direction.UP and at_top) or \
+                              (opposite_vert == Direction.DOWN and at_bottom)
             
-            # End opening phase after enough cut-in moves
-            if board.turn_count >= self._cut_in_turn + 6:
+            if at_opposite_edge or board.turn_count >= self._cut_in_turn + 8:
                 self._perimeter_phase = "done"
+            else:
+                move = pick_move_in_direction(opposite_vert)
+                if move:
+                    return move
+                
+                move = pick_move_in_direction(self._sweep_horizontal)
+                if move:
+                    return move
         
         # FALLBACK: If we get here, pick the best non-retreating move
         best_fallback = None

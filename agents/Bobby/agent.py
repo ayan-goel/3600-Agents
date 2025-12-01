@@ -765,3 +765,4 @@ class PlayerAgent:
         return (loc[0] + loc[1]) % 2 == self.my_parity
 
 
+
