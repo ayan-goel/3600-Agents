@@ -189,11 +189,10 @@ class PlayerAgent:
         self.enemy_parity = board.chicken_enemy.even_chicken
         self.trap_belief = TrapdoorBelief(self.size)
         self.visit_counts: Dict[Tuple[int, int], int] = {}
-        self.tt: Dict[int, Tuple[float, int, Tuple]] = {}  # Added best move to TT
+        self.tt: Dict[int, Tuple[float, int]] = {}
         self._deadline = 0.0
         self._cached_potential = 0.0
         self._danger_zone: Set[Tuple[int, int]] = set()
-        self._killer_moves: List[Tuple[Direction, MoveType]] = []  # Killer move heuristic
 
     def play(
         self,
@@ -305,47 +304,6 @@ class PlayerAgent:
         
         return result if result else moves
 
-    def _make_hash(self, board: Board, maximizing: bool) -> int:
-        """More accurate hash including board obstacles."""
-        return hash((
-            board.chicken_player.get_location(),
-            board.chicken_enemy.get_location(),
-            board.chicken_player.get_eggs_laid(),
-            board.chicken_enemy.get_eggs_laid(),
-            frozenset(board.eggs_player),
-            frozenset(board.eggs_enemy),
-            board.turn_count,
-            maximizing
-        ))
-
-    def _order_moves(self, moves: List[Tuple[Direction, MoveType]], board: Board, 
-                     tt_best: Tuple = None) -> List[Tuple[Direction, MoveType]]:
-        """Order moves for better alpha-beta pruning."""
-        if not moves:
-            return moves
-        
-        ordered = []
-        rest = []
-        
-        # 1. TT best move first (from previous iteration)
-        if tt_best and tt_best in moves:
-            ordered.append(tt_best)
-            moves = [m for m in moves if m != tt_best]
-        
-        # 2. Egg moves (highest priority)
-        egg_moves = [m for m in moves if m[1] == MoveType.EGG]
-        other_moves = [m for m in moves if m[1] != MoveType.EGG]
-        
-        # 3. Killer moves (caused cutoffs before)
-        for km in self._killer_moves:
-            if km in other_moves:
-                ordered.append(km)
-                other_moves.remove(km)
-        
-        ordered.extend(egg_moves)
-        ordered.extend(other_moves)
-        return ordered
-
     def _ab(self, board: Board, depth: int, alpha: float, beta: float, 
             maximizing: bool, tl: Callable[[], float]) -> float:
         if tl() < self._deadline:
@@ -359,41 +317,29 @@ class PlayerAgent:
         if depth == 0:
             return self._eval(board)
 
-        h = self._make_hash(board, maximizing)
-        tt_best = None
+        h = hash((board.chicken_player.get_location(), board.chicken_enemy.get_location(),
+                  board.chicken_player.get_eggs_laid(), board.chicken_enemy.get_eggs_laid(),
+                  board.turn_count, maximizing))
         if h in self.tt:
-            cs, cd, tb = self.tt[h]
+            cs, cd = self.tt[h]
             if cd >= depth:
                 return cs
-            tt_best = tb  # Use best move from shallower search for ordering
 
         if maximizing:
             moves = board.get_valid_moves(enemy=False)
             if not moves:
                 return self._eval(board)
             if board.can_lay_egg():
-                egg_moves = [m for m in moves if m[1] == MoveType.EGG]
-                if egg_moves:
-                    moves = egg_moves
-            moves = self._order_moves(moves, board, tt_best)
+                moves = [m for m in moves if m[1] == MoveType.EGG] or moves
             val = -1e9
-            best_move = moves[0] if moves else None
             for m in moves:
                 nb = board.forecast_move(m[0], m[1], check_ok=False)
                 if nb:
-                    child_val = self._ab(nb, depth-1, alpha, beta, False, tl)
-                    if child_val > val:
-                        val = child_val
-                        best_move = m
+                    val = max(val, self._ab(nb, depth-1, alpha, beta, False, tl))
                     alpha = max(alpha, val)
                     if beta <= alpha:
-                        # Killer move heuristic: remember this move
-                        if m[1] != MoveType.EGG and m not in self._killer_moves:
-                            self._killer_moves.insert(0, m)
-                            if len(self._killer_moves) > 4:
-                                self._killer_moves.pop()
                         break
-            self.tt[h] = (val, depth, best_move)
+            self.tt[h] = (val, depth)
             return val
         else:
             board.reverse_perspective()
@@ -402,25 +348,18 @@ class PlayerAgent:
                 board.reverse_perspective()
                 return self._eval(board)
             if board.can_lay_egg():
-                egg_moves = [m for m in moves if m[1] == MoveType.EGG]
-                if egg_moves:
-                    moves = egg_moves
-            moves = self._order_moves(moves, board, tt_best)
+                moves = [m for m in moves if m[1] == MoveType.EGG] or moves
             val = 1e9
-            best_move = moves[0] if moves else None
             for m in moves:
                 nb = board.forecast_move(m[0], m[1], check_ok=False)
                 if nb:
                     nb.reverse_perspective()
-                    child_val = self._ab(nb, depth-1, alpha, beta, True, tl)
-                    if child_val < val:
-                        val = child_val
-                        best_move = m
+                    val = min(val, self._ab(nb, depth-1, alpha, beta, True, tl))
                     beta = min(beta, val)
                     if beta <= alpha:
                         break
             board.reverse_perspective()
-            self.tt[h] = (val, depth, best_move)
+            self.tt[h] = (val, depth)
             return val
 
     def _eval(self, board: Board) -> float:
@@ -455,19 +394,6 @@ class PlayerAgent:
                     ed = abs(en_loc[0]-c[0]) + abs(en_loc[1]-c[1])
                     if md < ed:
                         score += 12.0 / max(md, 1)
-
-        # Bonus: On our parity tile = ready to lay egg
-        if (my_loc[0] + my_loc[1]) % 2 == self.my_parity:
-            score += 3.0
-        
-        # Mobility bonus: having safe escape routes is valuable
-        safe_neighbors = 0
-        for d in Direction:
-            nl = loc_after_direction(my_loc, d)
-            if 0 <= nl[0] < self.size and 0 <= nl[1] < self.size:
-                if self.trap_belief.get_total_risk(nl) < 0.15:
-                    safe_neighbors += 1
-        score += safe_neighbors * 1.5
 
         return score
 

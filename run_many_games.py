@@ -1,8 +1,8 @@
 import subprocess
 
 NUM_GAMES = 30
-AGENT_A = "Durant"
-AGENT_B = "MaldiniCopy"
+AGENT_A = "Neymar"
+AGENT_B = "OldNeymar"
 
 a_wins = 0
 b_wins = 0

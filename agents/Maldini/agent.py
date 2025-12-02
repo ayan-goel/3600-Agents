@@ -3310,4 +3310,3 @@ class PlayerAgent:
         if board.can_lay_egg() and self.moves_since_last_egg >= 1:
             return "egg"
         return "cutoff"
-
